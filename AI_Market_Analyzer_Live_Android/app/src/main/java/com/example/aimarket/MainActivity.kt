@@ -182,12 +182,25 @@ private fun LiveAnalyzerApp() {
                         HorizontalDivider(color = Color(0xFF283448))
                         Text("Alasan sinyal", fontWeight = FontWeight.Bold)
                         result.reasons.forEach { Text("• $it", color = Muted, fontSize = 12.sp, lineHeight = 17.sp) }
+                        val waiting = result.signal == "WAIT"
+                        Text("LEVEL ENTRY & TARGET", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Metric("Entry", if (waiting) "WAIT" else result.entryPrice?.let(::price) ?: "—")
+                            Metric("Stop Loss", if (waiting) "WAIT" else result.stopLoss?.let(::price) ?: "—")
+                        }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Metric("TP 1", if (waiting) "WAIT" else result.takeProfit1?.let(::price) ?: "—")
+                            Metric("TP 2", if (waiting) "WAIT" else result.takeProfit2?.let(::price) ?: "—")
+                            Metric("TP 3", if (waiting) "WAIT" else result.takeProfit3?.let(::price) ?: "—")
+                        }
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Metric("ATR 14", result.atr?.let(::price) ?: "—")
-                            Metric("Stop loss*", result.stopLoss?.let(::price) ?: "—")
-                            Metric("Target*", result.takeProfit?.let(::price) ?: "—")
                         }
-                        Text("*Estimasi berbasis ATR; bukan instruksi order. Periksa spread, biaya, dan likuiditas.", color = Amber, fontSize = 10.sp)
+                        Text(
+                            if (waiting) "WAIT berarti belum ada konfirmasi yang cukup. Level entry, SL, dan TP belum diberikan."
+                            else "*Level estimasi berbasis ATR dan volatilitas timeframe; bukan instruksi order. Harga eksekusi dapat berbeda. Periksa spread, biaya, dan risiko.",
+                            color = Amber, fontSize = 10.sp
+                        )
                     }
                 }
 
