@@ -122,9 +122,9 @@ private fun LiveAnalyzerApp() {
                 }
 
                 PanelCard {
-                    Text("CRYPTO • DATA PUBLIK", color = Muted, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text(if (symbol == "XAUUSD") "GOLD / XAUUSD • BIQUOTE FEED" else "CRYPTO • DATA PUBLIK BINANCE", color = Muted, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                        listOf("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT").forEach {
+                        listOf("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "XAUUSD").forEach {
                             Chip(it, symbol == it) { symbol = it }
                         }
                     }
@@ -136,29 +136,43 @@ private fun LiveAnalyzerApp() {
 
                 PanelCard {
                     Text(symbol, color = Muted, fontSize = 13.sp)
-                    Text(lastPrice?.let(::price) ?: "Menunggu data…", fontSize = 29.sp, fontWeight = FontWeight.Bold)
+                    Text(lastPrice?.let(::price) ?: if (symbol == "XAUUSD") "—" else "Menunggu data…", fontSize = 29.sp, fontWeight = FontWeight.Bold)
                     Text(status, color = if (connected) Green else Amber, fontSize = 11.sp)
                     Spacer(Modifier.height(4.dp))
-                    CandleChart(Modifier.fillMaxWidth().height(145.dp), candles.takeLast(70))
-                    Text("Harga live • sinyal memakai candle yang sudah tutup", color = Muted, fontSize = 11.sp)
+                    if (symbol == "XAUUSD" && !connected) {
+                        Text(
+                            "Chart dan sinyal XAUUSD disembunyikan karena pasar tutup, data kedaluwarsa, atau feed belum tersedia. Coba refresh saat pasar aktif.",
+                            color = Amber, fontSize = 12.sp, lineHeight = 17.sp
+                        )
+                    } else {
+                        CandleChart(Modifier.fillMaxWidth().height(145.dp), candles.takeLast(70))
+                        Text(
+                            if (symbol == "XAUUSD") "Harga emas • sumber Biquote • sinyal memakai candle yang sudah tutup"
+                            else "Harga live • sinyal memakai candle yang sudah tutup",
+                            color = Muted, fontSize = 11.sp
+                        )
+                    }
                 }
 
                 PanelCard {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Text("AUTO SIGNAL", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                        Surface(color = when (result?.signal) {
+                        val shownSignal = if (symbol == "XAUUSD" && !connected) "MARKET CLOSED" else (result?.signal ?: "ANALYZING")
+                        Surface(color = when (shownSignal) {
                             "BUY" -> Color(0xFF17382F)
                             "SELL" -> Color(0xFF48212A)
                             else -> Color(0xFF49351A)
                         }, shape = RoundedCornerShape(10.dp)) {
-                            Text(result?.signal ?: "ANALYZING", Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                color = when (result?.signal) { "BUY" -> Green; "SELL" -> Red; else -> Amber },
+                            Text(shownSignal, Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                color = when (shownSignal) { "BUY" -> Green; "SELL" -> Red; else -> Amber },
                                 fontWeight = FontWeight.ExtraBold)
                         }
                     }
                     Text(if (result == null) "Mengumpulkan minimal 52 candle tertutup untuk analisis." else "Skor aturan teknikal: ${result.score}/100",
                         color = Muted, fontSize = 12.sp)
-                    if (result != null) {
+                    if (symbol == "XAUUSD" && !connected) {
+                        Text("Tidak ada sinyal baru saat pasar tutup atau data XAUUSD tidak valid.", color = Muted, fontSize = 12.sp)
+                    } else if (result != null) {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Metric("RSI 14", result.rsi?.let { "%.1f".format(it) } ?: "—")
                             Metric("EMA 9", result.ema9?.let(::price) ?: "—")
@@ -199,7 +213,7 @@ private fun LiveAnalyzerApp() {
                     else "Aktifkan izin notifikasi agar HP memberi peringatan saat muncul sinyal BUY/SELL baru.",
                     color = Muted, fontSize = 11.sp, lineHeight = 16.sp
                 )
-                Text("Versi ini live untuk crypto spot publik. Forex, saham, dan indeks belum diaktifkan. Tidak melakukan transaksi otomatis.",
+                Text("Crypto memakai data publik Binance. XAUUSD memakai feed publik Biquote dan diperiksa status market/data-nya; saat tutup atau kedaluwarsa, chart dan sinyal disembunyikan. Tidak melakukan transaksi otomatis.",
                     color = Muted, fontSize = 11.sp, lineHeight = 16.sp)
                 Spacer(Modifier.height(12.dp))
             }
@@ -285,7 +299,8 @@ private fun showSignalNotification(
 ) {
     if (!hasNotificationPermission(context)) return
     val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-    val body = "$symbol • $interval • skor $score/100 • harga ${price(currentPrice)} USDT"
+    val currency = if (symbol == "XAUUSD") "USD" else "USDT"
+    val body = "$symbol • $interval • skor $score/100 • harga ${price(currentPrice)} $currency"
     val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         Notification.Builder(context, SIGNAL_CHANNEL_ID)
     } else {
