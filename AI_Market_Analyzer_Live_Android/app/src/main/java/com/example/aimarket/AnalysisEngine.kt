@@ -26,7 +26,11 @@ data class AnalysisResult(
     val atr: Double?,
     val stopLoss: Double?,
     val takeProfit: Double?,
-    val reasons: List<String>
+    val reasons: List<String>,
+    val entryPrice: Double? = null,
+    val takeProfit1: Double? = null,
+    val takeProfit2: Double? = null,
+    val takeProfit3: Double? = null
 )
 
 object AnalysisEngine {
@@ -207,25 +211,43 @@ object AnalysisEngine {
             else -> "WAIT"
         }
 
-        val stop = atrValue?.let {
-            when (signal) {
-                "SELL" -> last + 1.5 * it
-                else -> last - 1.5 * it
-            }
-        }
-        val target = atrValue?.let {
-            when (signal) {
-                "SELL" -> last - 2.0 * it
-                else -> last + 2.0 * it
-            }
-        }
+        // WAIT tidak memberi level entry/SL/TP. Untuk BUY/SELL, jarak dihitung
+        // dinamis dari ATR agar mengikuti volatilitas instrumen/timeframe.
+        val actionable = signal == "BUY" || signal == "SELL"
+        val direction = if (signal == "SELL") -1.0 else 1.0
+        val entry = if (actionable) last else null
+        val stop = if (actionable && atrValue != null) {
+            if (signal == "SELL") last + 1.5 * atrValue else last - 1.5 * atrValue
+        } else null
+        val tp1 = if (actionable && atrValue != null) last + direction * 1.0 * atrValue else null
+        val tp2 = if (actionable && atrValue != null) last + direction * 2.0 * atrValue else null
+        val tp3 = if (actionable && atrValue != null) last + direction * 3.0 * atrValue else null
 
-        reasons += "SMC, trendline, SNR, dan SND di sini adalah deteksi teknikal sederhana, bukan jaminan hasil atau probabilitas profit."
+        reasons += if (signal == "WAIT") {
+            "WAIT: belum ada konfirmasi yang cukup; entry, SL, dan TP tidak ditampilkan."
+        } else {
+            "Entry memakai harga candle tertutup terakhir; SL dan TP1/TP2/TP3 dihitung dinamis dari ATR. Harga eksekusi nyata dapat berbeda."
+        }
+        reasons += "SMC, trendline, SNR, dan SND adalah deteksi teknikal sederhana, bukan jaminan hasil atau probabilitas profit."
         reasons += "Sinyal dihitung dari candle yang sudah tutup; bukan instruksi transaksi otomatis."
 
         return AnalysisResult(
-            last, signal, score, rsiValue, e9, e21, e50,
-            macdValue, atrValue, stop, target, reasons
+            lastPrice = last,
+            signal = signal,
+            score = score,
+            rsi = rsiValue,
+            ema9 = e9,
+            ema21 = e21,
+            ema50 = e50,
+            macd = macdValue,
+            atr = atrValue,
+            stopLoss = stop,
+            takeProfit = tp2,
+            reasons = reasons,
+            entryPrice = entry,
+            takeProfit1 = tp1,
+            takeProfit2 = tp2,
+            takeProfit3 = tp3
         )
     }
 
