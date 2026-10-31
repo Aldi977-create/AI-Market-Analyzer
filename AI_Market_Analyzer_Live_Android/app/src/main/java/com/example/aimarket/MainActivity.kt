@@ -1,8 +1,17 @@
 package com.example.aimarket
 
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
@@ -15,9 +24,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import kotlin.math.max
 import kotlin.math.min
 
@@ -31,18 +42,28 @@ private val Amber = Color(0xFFFFC857)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        createSignalNotificationChannel(this)
         setContent { LiveAnalyzerApp() }
     }
 }
 
 @Composable
 private fun LiveAnalyzerApp() {
+    val context = LocalContext.current
+    var notificationsEnabled by remember { mutableStateOf(hasNotificationPermission(context)) }
     var symbol by remember { mutableStateOf("BTCUSDT") }
     var interval by remember { mutableStateOf("1m") }
     var candles by remember { mutableStateOf<List<Candle>>(emptyList()) }
     var connected by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Menghubungkan…") }
     var refreshKey by remember { mutableIntStateOf(0) }
+    var observedContext by remember { mutableStateOf("") }
+    var observedSignal by remember { mutableStateOf<String?>(null) }
+    var observedClosedCandleTime by remember { mutableLongStateOf(0L) }
+
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted -> notificationsEnabled = granted || Build.VERSION.SDK_INT < 33 }
 
     DisposableEffect(symbol, interval, refreshKey) {
         val repo = LiveMarketRepository { data, live, message ->
@@ -55,6 +76,30 @@ private fun LiveAnalyzerApp() {
     }
     val result = remember(candles) { AnalysisEngine.analyze(candles) }
     val lastPrice = candles.lastOrNull()?.close
+
+    // Kirim notifikasi hanya ketika candle tertutup baru menghasilkan perubahan sinyal ke BUY/SELL.
+    // Data historis pertama dijadikan baseline agar tidak langsung membanjiri notifikasi saat aplikasi dibuka.
+    LaunchedEffect(symbol, interval, candles, result) {
+        val closedCandle = candles.lastOrNull { it.closed }
+        val signal = result?.signal
+        if (closedCandle == null || signal == null) return@LaunchedEffect
+        val currentContext = "$symbol|$interval"
+        if (observedContext != currentContext || observedClosedCandleTime == 0L) {
+            observedContext = currentContext
+            observedClosedCandleTime = closedCandle.time
+            observedSignal = signal
+            return@LaunchedEffect
+        }
+        if (closedCandle.time > observedClosedCandleTime) {
+            val isNewActionSignal = signal in listOf("BUY", "SELL") && signal != observedSignal
+            if (isNewActionSignal && hasNotificationPermission(context)) {
+                showSignalNotification(context, symbol, interval, signal, result.score, result.lastPrice)
+            }
+            observedClosedCandleTime = closedCandle.time
+            observedSignal = signal
+        }
+    }
+
     MaterialTheme(colorScheme = darkColorScheme(
         background = Bg, surface = Panel, primary = Green,
         onBackground = Color.White, onSurface = Color.White
@@ -136,6 +181,24 @@ private fun LiveAnalyzerApp() {
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF17382F))) {
                     Text("Reconnect / Refresh data", color = Green)
                 }
+                Button(
+                    onClick = {
+                        if (Build.VERSION.SDK_INT >= 33 && !hasNotificationPermission(context)) {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        } else {
+                            notificationsEnabled = true
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF17382F))
+                ) {
+                    Text(if (notificationsEnabled) "Notifikasi BUY / SELL aktif ✓" else "Aktifkan notifikasi BUY / SELL", color = Green)
+                }
+                Text(
+                    if (notificationsEnabled) "Notifikasi muncul saat aplikasi terbuka, koneksi live aktif, dan sinyal berubah ke BUY/SELL pada candle yang sudah tutup."
+                    else "Aktifkan izin notifikasi agar HP memberi peringatan saat muncul sinyal BUY/SELL baru.",
+                    color = Muted, fontSize = 11.sp, lineHeight = 16.sp
+                )
                 Text("Versi ini live untuk crypto spot publik. Forex, saham, dan indeks belum diaktifkan. Tidak melakukan transaksi otomatis.",
                     color = Muted, fontSize = 11.sp, lineHeight = 16.sp)
                 Spacer(Modifier.height(12.dp))
@@ -187,3 +250,55 @@ private fun CandleChart(modifier: Modifier, data: List<Candle>) {
     }
 }
 private fun price(v: Double): String = if (v >= 1000) "%,.2f".format(v) else if (v >= 1) "%.4f".format(v) else "%.6f".format(v)
+
+
+private const val SIGNAL_CHANNEL_ID = "market_signal_alerts"
+
+private fun createSignalNotificationChannel(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = NotificationChannel(
+            SIGNAL_CHANNEL_ID,
+            "Sinyal BUY / SELL",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Peringatan saat sinyal crypto berubah menjadi BUY atau SELL baru"
+        }
+        manager.createNotificationChannel(channel)
+    }
+}
+
+private fun hasNotificationPermission(context: Context): Boolean {
+    return Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.POST_NOTIFICATIONS
+    ) == PackageManager.PERMISSION_GRANTED
+}
+
+private fun showSignalNotification(
+    context: Context,
+    symbol: String,
+    interval: String,
+    signal: String,
+    score: Int,
+    currentPrice: Double
+) {
+    if (!hasNotificationPermission(context)) return
+    val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    val body = "$symbol • $interval • skor $score/100 • harga ${price(currentPrice)} USDT"
+    val notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        Notification.Builder(context, SIGNAL_CHANNEL_ID)
+    } else {
+        @Suppress("DEPRECATION")
+        Notification.Builder(context)
+    }
+        .setSmallIcon(android.R.drawable.ic_dialog_info)
+        .setContentTitle("Sinyal $signal baru — $symbol")
+        .setContentText(body)
+        .setStyle(Notification.BigTextStyle().bigText("$body\nSinyal berbasis aturan teknikal, bukan jaminan profit. Periksa chart sebelum mengambil keputusan."))
+        .setCategory(Notification.CATEGORY_STATUS)
+        .setAutoCancel(true)
+        .setPriority(Notification.PRIORITY_HIGH)
+        .build()
+    manager.notify((symbol + interval).hashCode(), notification)
+}
