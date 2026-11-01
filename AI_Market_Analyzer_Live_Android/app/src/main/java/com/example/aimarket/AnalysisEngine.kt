@@ -34,202 +34,307 @@ data class AnalysisResult(
 )
 
 object AnalysisEngine {
+
     private data class Pivot(val index: Int, val price: Double)
 
     fun analyze(candles: List<Candle>): AnalysisResult? {
-        if (candles.size < 52) return null
-
-        // Gunakan candle yang sudah tutup agar sinyal tidak mudah berubah intrabar.
-        val stable = candles.filter { it.closed }
+        val stable = candles.filter { it.closed }.takeLast(300)
         if (stable.size < 52) return null
 
         val closes = stable.map { it.close }
-        val last = closes.last()
+        val lastCandle = stable.last()
+        val last = lastCandle.close
+
         val e9 = ema(closes, 9) ?: return null
         val e21 = ema(closes, 21) ?: return null
         val e50 = ema(closes, 50) ?: return null
         val rsiValue = rsi(closes, 14)
         val atrValue = atr(stable, 14)
-        val macdValue = (ema(closes, 12) ?: last) - (ema(closes, 26) ?: last)
+        val macdValue =
+            (ema(closes, 12) ?: last) - (ema(closes, 26) ?: last)
 
-        var score = 50
+        val atr = atrValue?.takeIf { it > 0.0 && it.isFinite() }
         val reasons = mutableListOf<String>()
+        var score = 50
 
-        // Indikator dasar yang sudah ada sebelumnya.
-        if (e9 > e21) {
-            score += 10
-            reasons += "EMA 9 di atas EMA 21: momentum jangka pendek bullish."
-        } else {
-            score -= 10
-            reasons += "EMA 9 di bawah EMA 21: momentum jangka pendek bearish."
+        // Arah tren utama.
+        val bullishTrend = e9 > e21 && e21 > e50
+        val bearishTrend = e9 < e21 && e21 < e50
+
+        when {
+            bullishTrend -> {
+                score += 16
+                reasons += "Tren bullish: EMA 9 > EMA 21 > EMA 50."
+            }
+            bearishTrend -> {
+                score -= 16
+                reasons += "Tren bearish: EMA 9 < EMA 21 < EMA 50."
+            }
+            e9 > e21 -> {
+                score += 7
+                reasons += "Momentum jangka pendek bullish, tetapi susunan EMA belum lengkap."
+            }
+            e9 < e21 -> {
+                score -= 7
+                reasons += "Momentum jangka pendek bearish, tetapi susunan EMA belum lengkap."
+            }
+            else -> reasons += "EMA berdekatan; arah tren belum jelas."
         }
 
-        if (e21 > e50) {
-            score += 10
-            reasons += "EMA 21 di atas EMA 50: tren menengah bullish."
-        } else {
-            score -= 10
-            reasons += "EMA 21 di bawah EMA 50: tren menengah bearish."
-        }
-
+        // RSI: hindari menghukum tren kuat hanya karena RSI tinggi/rendah.
         if (rsiValue != null) {
             when {
-                rsiValue in 52.0..68.0 -> {
-                    score += 7
+                rsiValue >= 55.0 && rsiValue <= 70.0 -> {
+                    score += 9
                     reasons += "RSI ${"%.1f".format(rsiValue)} mendukung momentum bullish."
                 }
-                rsiValue in 32.0..48.0 -> {
-                    score -= 7
+                rsiValue > 70.0 -> {
+                    score += if (bullishTrend) 3 else -3
+                    reasons += "RSI ${"%.1f".format(rsiValue)} tinggi; hindari mengejar harga tanpa konfirmasi."
+                }
+                rsiValue >= 30.0 && rsiValue <= 45.0 -> {
+                    score -= 9
                     reasons += "RSI ${"%.1f".format(rsiValue)} mendukung momentum bearish."
                 }
-                rsiValue > 70.0 -> {
-                    score -= 3
-                    reasons += "RSI ${"%.1f".format(rsiValue)} tinggi; waspadai pullback."
-                }
                 rsiValue < 30.0 -> {
-                    score += 3
-                    reasons += "RSI ${"%.1f".format(rsiValue)} rendah; pantulan belum terkonfirmasi."
+                    score += if (bearishTrend) -3 else 3
+                    reasons += "RSI ${"%.1f".format(rsiValue)} rendah; waspadai pantulan."
                 }
                 else -> reasons += "RSI ${"%.1f".format(rsiValue)} belum memberi konfirmasi kuat."
             }
         }
 
-        if (macdValue > 0) {
-            score += 4
-            reasons += "MACD line di atas nol."
-        } else {
-            score -= 4
-            reasons += "MACD line di bawah nol."
+        if (macdValue > 0.0) {
+            score += 5
+            reasons += "MACD line berada di atas nol."
+        } else if (macdValue < 0.0) {
+            score -= 5
+            reasons += "MACD line berada di bawah nol."
         }
 
-        // SMC sederhana: swing high/low, BOS dan indikasi CHOCH.
+        // Momentum candle dibandingkan ATR.
+        val body = abs(lastCandle.close - lastCandle.open)
+        val bullishCandle = lastCandle.close > lastCandle.open
+        val bearishCandle = lastCandle.close < lastCandle.open
+
+        val strongBullishCandle =
+            atr != null && bullishCandle && body >= atr * 0.65
+
+        val strongBearishCandle =
+            atr != null && bearishCandle && body >= atr * 0.65
+
+        if (strongBullishCandle) {
+            score += 8
+            reasons += "Candle bullish memiliki body besar relatif terhadap ATR."
+        } else if (strongBearishCandle) {
+            score -= 8
+            reasons += "Candle bearish memiliki body besar relatif terhadap ATR."
+        }
+
+        // Struktur swing dan breakout.
         val highs = findPivotHighs(stable)
         val lows = findPivotLows(stable)
-        val previousHigh = highs.lastOrNull { it.index < stable.lastIndex - 1 }
-        val previousLow = lows.lastOrNull { it.index < stable.lastIndex - 1 }
-        val latestHigh = highs.lastOrNull()
-        val latestLow = lows.lastOrNull()
 
-        val bullishBos = previousHigh != null && last > previousHigh.price &&
-            stable.last().close > stable.last().open
-        val bearishBos = previousLow != null && last < previousLow.price &&
-            stable.last().close < stable.last().open
+        // Pivot yang cukup lama untuk dianggap telah terkonfirmasi.
+        val confirmedHighs = highs.filter { it.index < stable.lastIndex - 1 }
+        val confirmedLows = lows.filter { it.index < stable.lastIndex - 1 }
 
-        when {
-            bullishBos -> {
-                score += 9
-                reasons += "SMC: harga menembus swing high sebelumnya (indikasi bullish BOS)."
-            }
-            bearishBos -> {
-                score -= 9
-                reasons += "SMC: harga menembus swing low sebelumnya (indikasi bearish BOS)."
-            }
-            latestHigh != null && latestLow != null &&
-                latestHigh.index > latestLow.index && e9 < e21 -> {
-                score -= 2
-                reasons += "SMC: struktur terakhir berpotensi berubah bearish; CHOCH belum terkonfirmasi."
-            }
-            latestLow != null && latestHigh != null &&
-                latestLow.index > latestHigh.index && e9 > e21 -> {
-                score += 2
-                reasons += "SMC: struktur terakhir berpotensi berubah bullish; CHOCH belum terkonfirmasi."
-            }
-            else -> reasons += "SMC: belum ada penembusan swing yang terkonfirmasi."
-        }
+        val previousHigh = confirmedHighs.lastOrNull()
+        val previousLow = confirmedLows.lastOrNull()
 
-        // Trendline sederhana dari dua pivot terakhir.
-        val trendlineHighs = highs.takeLast(2)
-        val trendlineLows = lows.takeLast(2)
-        when {
-            trendlineLows.size == 2 &&
-                trendlineLows[1].price > trendlineLows[0].price -> {
-                score += 5
-                reasons += "Trendline: dua swing low terakhir naik, mendukung tren naik."
-            }
-            trendlineLows.size == 2 &&
-                trendlineLows[1].price < trendlineLows[0].price -> {
-                score -= 5
-                reasons += "Trendline: dua swing low terakhir turun, mendukung tren lemah."
-            }
-            trendlineHighs.size == 2 &&
-                trendlineHighs[1].price < trendlineHighs[0].price -> {
-                score -= 5
-                reasons += "Trendline: dua swing high terakhir turun, mendukung tren turun."
-            }
-            trendlineHighs.size == 2 &&
-                trendlineHighs[1].price > trendlineHighs[0].price -> {
-                score += 5
-                reasons += "Trendline: dua swing high terakhir naik, mendukung tren naik."
-            }
-            else -> reasons += "Trendline: pivot belum cukup untuk menentukan arah."
-        }
+        val bullishBreakout =
+            previousHigh != null &&
+                lastCandle.close > previousHigh.price &&
+                bullishCandle
 
-        // SNR: posisi harga terhadap swing support/resistance terdekat.
-        val support = lows.lastOrNull { it.price <= last }?.price
-        val resistance = highs.lastOrNull { it.price >= last }?.price
-        val proximity = atrValue?.times(0.6) ?: (last * 0.002)
+        val bearishBreakout =
+            previousLow != null &&
+                lastCandle.close < previousLow.price &&
+                bearishCandle
 
-        if (support != null && abs(last - support) <= proximity) {
-            score += 4
-            reasons += "SNR: harga dekat support swing (${formatPrice(support)}); pantulan tetap perlu konfirmasi."
-        } else if (resistance != null && abs(resistance - last) <= proximity) {
-            score -= 4
-            reasons += "SNR: harga dekat resistance swing (${formatPrice(resistance)}); waspadai penolakan harga."
+        if (bullishBreakout) {
+            score += 12
+            reasons += "Breakout bullish: candle tertutup menembus swing high."
+        } else if (bearishBreakout) {
+            score -= 12
+            reasons += "Breakout bearish: candle tertutup menembus swing low."
         } else {
-            reasons += "SNR: harga belum dekat support/resistance swing yang terdeteksi."
+            reasons += "Belum ada breakout swing yang terkonfirmasi."
         }
 
-        // SND: zona demand/supply pendekatan sederhana dari candle pivot.
-        val demand = findDemandZone(stable, last)
-        val supply = findSupplyZone(stable, last)
-        when {
-            demand != null && last >= demand.first && last <= demand.second -> {
-                score += 4
-                reasons += "SND: harga berada di zona demand perkiraan; belum menjamin harga memantul."
+        // Urutan swing untuk konfirmasi struktur.
+        val lastTwoHighs = confirmedHighs.takeLast(2)
+        val lastTwoLows = confirmedLows.takeLast(2)
+
+        if (lastTwoHighs.size == 2 && lastTwoLows.size == 2) {
+            val higherHigh =
+                lastTwoHighs[1].price > lastTwoHighs[0].price
+            val higherLow =
+                lastTwoLows[1].price > lastTwoLows[0].price
+            val lowerHigh =
+                lastTwoHighs[1].price < lastTwoHighs[0].price
+            val lowerLow =
+                lastTwoLows[1].price < lastTwoLows[0].price
+
+            when {
+                higherHigh && higherLow -> {
+                    score += 7
+                    reasons += "Struktur harga membentuk higher high dan higher low."
+                }
+                lowerHigh && lowerLow -> {
+                    score -= 7
+                    reasons += "Struktur harga membentuk lower high dan lower low."
+                }
             }
-            supply != null && last >= supply.first && last <= supply.second -> {
-                score -= 4
-                reasons += "SND: harga berada di zona supply perkiraan; belum menjamin harga turun."
+        }
+
+        // Volume hanya dipakai bila feed menyediakan data volume yang berguna.
+        val recentVolumes = stable.takeLast(21).dropLast(1)
+            .map { it.volume }
+            .filter { it > 0.0 && it.isFinite() }
+
+        if (recentVolumes.size >= 10 && lastCandle.volume > 0.0) {
+            val averageVolume = recentVolumes.average()
+
+            if (averageVolume > 0.0 &&
+                lastCandle.volume >= averageVolume * 1.5
+            ) {
+                when {
+                    bullishCandle -> {
+                        score += 4
+                        reasons += "Volume di atas rata-rata mendukung candle bullish."
+                    }
+                    bearishCandle -> {
+                        score -= 4
+                        reasons += "Volume di atas rata-rata mendukung candle bearish."
+                    }
+                }
             }
-            demand != null && last > demand.second &&
-                last - demand.second <= proximity -> {
-                score += 2
-                reasons += "SND: harga dekat batas atas zona demand perkiraan."
-            }
-            supply != null && last < supply.first &&
-                supply.first - last <= proximity -> {
-                score -= 2
-                reasons += "SND: harga dekat batas bawah zona supply perkiraan."
-            }
-            else -> reasons += "SND: tidak ada zona supply/demand dekat harga yang terdeteksi."
+        }
+
+        // Support dan resistance dari pivot terkonfirmasi.
+        val support = confirmedLows.lastOrNull {
+            it.price < last
+        }?.price
+
+        val resistance = confirmedHighs.lastOrNull {
+            it.price > last
+        }?.price
+
+        val proximity = atr?.times(0.6) ?: last * 0.002
+
+        if (support != null && last - support <= proximity) {
+            score += 3
+            reasons += "Harga relatif dekat support swing."
+        }
+
+        if (resistance != null && resistance - last <= proximity) {
+            score -= 3
+            reasons += "Harga relatif dekat resistance swing."
         }
 
         score = score.coerceIn(0, 100)
+
+        // Sinyal harus searah dengan tren atau memiliki breakout yang jelas.
+        val bullishSetup =
+            bullishTrend || (e9 > e21 && bullishBreakout)
+
+        val bearishSetup =
+            bearishTrend || (e9 < e21 && bearishBreakout)
+
         val signal = when {
-            score >= 70 -> "BUY"
-            score <= 30 -> "SELL"
+            score >= 70 && bullishSetup -> "BUY"
+            score <= 30 && bearishSetup -> "SELL"
             else -> "WAIT"
         }
 
-        // WAIT tidak memberi level entry/SL/TP. Untuk BUY/SELL, jarak dihitung
-        // dinamis dari ATR agar mengikuti volatilitas instrumen/timeframe.
         val actionable = signal == "BUY" || signal == "SELL"
-        val direction = if (signal == "SELL") -1.0 else 1.0
-        val entry = if (actionable) last else null
-        val stop = if (actionable && atrValue != null) {
-            if (signal == "SELL") last + 1.5 * atrValue else last - 1.5 * atrValue
-        } else null
-        val tp1 = if (actionable && atrValue != null) last + direction * 1.0 * atrValue else null
-        val tp2 = if (actionable && atrValue != null) last + direction * 2.0 * atrValue else null
-        val tp3 = if (actionable && atrValue != null) last + direction * 3.0 * atrValue else null
+        val direction = if (signal == "BUY") 1.0 else -1.0
 
-        reasons += if (signal == "WAIT") {
-            "WAIT: belum ada konfirmasi yang cukup; entry, SL, dan TP tidak ditampilkan."
-        } else {
-            "Entry memakai harga candle tertutup terakhir; SL dan TP1/TP2/TP3 dihitung dinamis dari ATR. Harga eksekusi nyata dapat berbeda."
+        var entry: Double? = null
+        var stop: Double? = null
+        var tp1: Double? = null
+        var tp2: Double? = null
+        var tp3: Double? = null
+
+        if (actionable && atr != null) {
+            entry = last
+
+            // SL berbasis struktur swing dengan batas minimum ATR.
+            val structuralStop = if (signal == "BUY") {
+                support?.takeIf { it < entry }?.minus(atr * 0.10)
+            } else {
+                resistance?.takeIf { it > entry }?.plus(atr * 0.10)
+            }
+
+            val minimumRisk = atr * 1.2
+
+            val calculatedStop = if (signal == "BUY") {
+                min(entry - minimumRisk, structuralStop ?: (entry - minimumRisk))
+            } else {
+                max(entry + minimumRisk, structuralStop ?: (entry + minimumRisk))
+            }
+
+            val risk = abs(entry - calculatedStop)
+
+            // Hindari level yang tidak valid.
+            if (risk > 0.0 && risk.isFinite()) {
+                stop = calculatedStop
+
+                val target1 = entry + direction * risk
+                val target2 = entry + direction * risk * 2.0
+                val target3 = entry + direction * risk * 3.0
+
+                // Periksa ruang harga sampai resistance/support terdekat.
+                // Jika hambatan terlalu dekat, target yang melewatinya disembunyikan.
+                val obstacle = if (signal == "BUY") {
+                    resistance?.takeIf { it > entry }
+                } else {
+                    support?.takeIf { it < entry }
+                }
+
+                fun targetIsPlausible(target: Double): Boolean {
+                    if (obstacle == null) return true
+
+                    val buffer = atr * 0.10
+                    return if (signal == "BUY") {
+                        target <= obstacle + buffer
+                    } else {
+                        target >= obstacle - buffer
+                    }
+                }
+
+                if (targetIsPlausible(target1)) tp1 = target1
+                if (tp1 != null && targetIsPlausible(target2)) tp2 = target2
+                if (tp2 != null && targetIsPlausible(target3)) tp3 = target3
+
+                reasons += "SL menggunakan swing terdekat bila tersedia dan jarak minimum 1,2 ATR."
+                reasons += "TP dihitung dari risiko entry ke SL: TP1 = RR 1:1, TP2 = RR 1:2, TP3 = RR 1:3."
+                reasons += if (obstacle != null) {
+                    "Target yang melewati resistance/support terdekat disaring. Target tidak dijamin tercapai."
+                } else {
+                    "Belum ada hambatan swing terdekat yang terdeteksi; target tetap bersifat estimasi."
+                }
+
+                if (tp1 == null) {
+                    reasons += "TP1 tidak ditampilkan karena ruang harga menuju target belum memadai."
+                }
+                if (tp1 != null && tp2 == null) {
+                    reasons += "TP2 tidak ditampilkan karena ruang harga menuju target belum memadai."
+                }
+                if (tp2 != null && tp3 == null) {
+                    reasons += "TP3 tidak ditampilkan karena ruang harga menuju target belum memadai."
+                }
+            }
         }
-        reasons += "SMC, trendline, SNR, dan SND adalah deteksi teknikal sederhana, bukan jaminan hasil atau probabilitas profit."
-        reasons += "Sinyal dihitung dari candle yang sudah tutup; bukan instruksi transaksi otomatis."
+
+        if (signal == "WAIT") {
+            reasons += "WAIT: skor atau konfirmasi tren belum memenuhi syarat entry."
+        }
+
+        reasons += "Skor adalah nilai aturan teknikal, bukan probabilitas profit."
+        reasons += "Harga entry, spread, slippage, dan biaya transaksi nyata dapat berbeda."
+        reasons += "Sinyal menggunakan candle tertutup dan tidak mengeksekusi transaksi otomatis."
 
         return AnalysisResult(
             lastPrice = last,
@@ -240,7 +345,7 @@ object AnalysisEngine {
             ema21 = e21,
             ema50 = e50,
             macd = macdValue,
-            atr = atrValue,
+            atr = atr,
             stopLoss = stop,
             takeProfit = tp2,
             reasons = reasons,
@@ -251,86 +356,105 @@ object AnalysisEngine {
         )
     }
 
-    private fun findPivotHighs(candles: List<Candle>, radius: Int = 2): List<Pivot> {
+    private fun findPivotHighs(
+        candles: List<Candle>,
+        radius: Int = 2
+    ): List<Pivot> {
         if (candles.size < radius * 2 + 1) return emptyList()
+
         val result = mutableListOf<Pivot>()
+
         for (i in radius until candles.size - radius) {
-            val price = candles[i].high
+            val value = candles[i].high
             var isPivot = true
+
             for (j in (i - radius)..(i + radius)) {
-                if (j != i && candles[j].high >= price) {
+                if (j != i && candles[j].high >= value) {
                     isPivot = false
                     break
                 }
             }
-            if (isPivot) result += Pivot(i, price)
+
+            if (isPivot) result += Pivot(i, value)
         }
+
         return result
     }
 
-    private fun findPivotLows(candles: List<Candle>, radius: Int = 2): List<Pivot> {
+    private fun findPivotLows(
+        candles: List<Candle,
+        radius: Int = 2
+    ): List<Pivot> {
         if (candles.size < radius * 2 + 1) return emptyList()
+
         val result = mutableListOf<Pivot>()
+
         for (i in radius until candles.size - radius) {
-            val price = candles[i].low
+            val value = candles[i].low
             var isPivot = true
+
             for (j in (i - radius)..(i + radius)) {
-                if (j != i && candles[j].low <= price) {
+                if (j != i && candles[j].low <= value) {
                     isPivot = false
                     break
                 }
             }
-            if (isPivot) result += Pivot(i, price)
+
+            if (isPivot) result += Pivot(i, value)
         }
+
         return result
     }
-
-    private fun findDemandZone(candles: List<Candle>, price: Double): Pair<Double, Double>? {
-        val pivots = findPivotLows(candles)
-        val pivot = pivots.lastOrNull { it.price <= price * 1.01 } ?: return null
-        val candle = candles[pivot.index]
-        return Pair(candle.low, max(candle.open, candle.close))
-    }
-
-    private fun findSupplyZone(candles: List<Candle>, price: Double): Pair<Double, Double>? {
-        val pivots = findPivotHighs(candles)
-        val pivot = pivots.lastOrNull { it.price >= price * 0.99 } ?: return null
-        val candle = candles[pivot.index]
-        return Pair(min(candle.open, candle.close), candle.high)
-    }
-
-    private fun formatPrice(value: Double): String = "%.4f".format(value)
 
     private fun ema(values: List<Double>, period: Int): Double? {
         if (values.size < period) return null
+
         val alpha = 2.0 / (period + 1)
         var value = values.take(period).average()
-        for (x in values.drop(period)) value = alpha * x + (1 - alpha) * value
+
+        for (x in values.drop(period)) {
+            value = alpha * x + (1.0 - alpha) * value
+        }
+
         return value
     }
 
     private fun rsi(values: List<Double>, period: Int): Double? {
         if (values.size <= period) return null
+
         var gain = 0.0
         var loss = 0.0
+
         for (i in 1..period) {
-            val d = values[i] - values[i - 1]
-            if (d >= 0) gain += d else loss -= d
+            val change = values[i] - values[i - 1]
+            if (change >= 0.0) gain += change else loss -= change
         }
+
         var averageGain = gain / period
         var averageLoss = loss / period
+
         for (i in (period + 1) until values.size) {
-            val d = values[i] - values[i - 1]
-            averageGain = (averageGain * (period - 1) + max(d, 0.0)) / period
-            averageLoss = (averageLoss * (period - 1) + max(-d, 0.0)) / period
+            val change = values[i] - values[i - 1]
+            averageGain =
+                (averageGain * (period - 1) + max(change, 0.0)) / period
+            averageLoss =
+                (averageLoss * (period - 1) + max(-change, 0.0)) / period
         }
+
         if (averageLoss == 0.0) return 100.0
-        return 100.0 - 100.0 / (1.0 + averageGain / averageLoss)
+
+        return 100.0 - 100.0 / (
+            1.0 + averageGain / averageLoss
+        )
     }
 
-    private fun atr(candles: List<Candle>, period: Int): Double? {
+    private fun atr(
+        candles: List<Candle>,
+        period: Int
+    ): Double? {
         if (candles.size < period + 1) return null
-        return candles.drop(1).mapIndexed { i, candle ->
+
+        val trueRanges = candles.drop(1).mapIndexed { i, candle ->
             max(
                 candle.high - candle.low,
                 max(
@@ -338,6 +462,8 @@ object AnalysisEngine {
                     abs(candle.low - candles[i].close)
                 )
             )
-        }.takeLast(period).average()
+        }
+
+        return trueRanges.takeLast(period).average()
     }
 }
