@@ -40,11 +40,13 @@ class TradingJournalRepository(context: Context) {
         takeProfit3: Double?,
         score: Int
     ): Long {
-        if (direction != TradingJournal.DIRECTION_BUY &&
+        if (
+            direction != TradingJournal.DIRECTION_BUY &&
             direction != TradingJournal.DIRECTION_SELL
         ) return -1L
 
-        if (!entryPrice.isFinite() ||
+        if (
+            !entryPrice.isFinite() ||
             !stopLoss.isFinite() ||
             !takeProfit1.isFinite() ||
             !takeProfit2.isFinite() ||
@@ -53,42 +55,54 @@ class TradingJournalRepository(context: Context) {
 
         if (entryPrice <= 0.0 || stopLoss <= 0.0) return -1L
 
-        val validLevels = if (direction == TradingJournal.DIRECTION_BUY) {
-            stopLoss < entryPrice &&
-                takeProfit1 > entryPrice &&
-                takeProfit2 > takeProfit1 &&
-                (takeProfit3 == null || takeProfit3 > takeProfit2)
-        } else {
-            stopLoss > entryPrice &&
-                takeProfit1 < entryPrice &&
-                takeProfit2 < takeProfit1 &&
-                (takeProfit3 == null || takeProfit3 < takeProfit2)
-        }
+        val validLevels =
+            if (direction == TradingJournal.DIRECTION_BUY) {
+                stopLoss < entryPrice &&
+                    takeProfit1 > entryPrice &&
+                    takeProfit2 > takeProfit1 &&
+                    (takeProfit3 == null || takeProfit3 > takeProfit2)
+            } else {
+                stopLoss > entryPrice &&
+                    takeProfit1 < entryPrice &&
+                    takeProfit2 < takeProfit1 &&
+                    (takeProfit3 == null || takeProfit3 < takeProfit2)
+            }
 
         if (!validLevels) return -1L
 
-        val entry = TradingJournal(
-            symbol = symbol,
-            timeframe = timeframe,
-            direction = direction,
-            signalTime = signalTime,
-            signalCandleTime = signalCandleTime,
-            entryPrice = entryPrice,
-            stopLoss = stopLoss,
-            takeProfit1 = takeProfit1,
-            takeProfit2 = takeProfit2,
-            takeProfit3 = takeProfit3,
-            score = score.coerceIn(0, 100)
-        )
+        return database.withTransaction {
+            // Satu entry OPEN saja untuk setiap simbol + timeframe.
+            val hasOpenEntry = dao.getOpenEntries().any {
+                it.symbol == symbol &&
+                    it.timeframe == timeframe
+            }
 
-        return dao.insert(entry)
+            if (hasOpenEntry) {
+                return@withTransaction -1L
+            }
+
+            val entry = TradingJournal(
+                symbol = symbol,
+                timeframe = timeframe,
+                direction = direction,
+                signalTime = signalTime,
+                signalCandleTime = signalCandleTime,
+                entryPrice = entryPrice,
+                stopLoss = stopLoss,
+                takeProfit1 = takeProfit1,
+                takeProfit2 = takeProfit2,
+                takeProfit3 = takeProfit3,
+                score = score.coerceIn(0, 100)
+            )
+
+            dao.insert(entry)
+        }
     }
 
     /**
-     * Process one fully closed candle for an open virtual trade.
-     *
-     * If SL and a target are touched in the same candle,
-     * SL takes precedence to keep backtest results conservative.
+     * Memproses candle yang sudah tertutup.
+     * Jika SL dan TP tersentuh dalam candle yang sama,
+     * SL diprioritaskan agar hasil backtest konservatif.
      */
     suspend fun processClosedCandle(
         symbol: String,
@@ -108,7 +122,12 @@ class TradingJournalRepository(context: Context) {
             }
 
             for (entry in entries) {
-                val updated = processCandle(entry, candleTime, high, low)
+                val updated = processCandle(
+                    entry,
+                    candleTime,
+                    high,
+                    low
+                )
                 dao.update(updated)
             }
         }
@@ -120,7 +139,8 @@ class TradingJournalRepository(context: Context) {
         high: Double,
         low: Double
     ): TradingJournal {
-        val isBuy = entry.direction == TradingJournal.DIRECTION_BUY
+        val isBuy =
+            entry.direction == TradingJournal.DIRECTION_BUY
 
         val stopHit = if (isBuy) {
             low <= entry.stopLoss
@@ -148,7 +168,6 @@ class TradingJournalRepository(context: Context) {
         val tp2Reached = entry.tp2Hit || tp2HitNow
         val tp3Reached = entry.tp3Hit || tp3HitNow
 
-        // Same-candle SL/TP ambiguity is resolved conservatively as SL.
         if (stopHit) {
             return entry.copy(
                 status = TradingJournal.STATUS_SL,
@@ -180,7 +199,6 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
-        // If TP3 does not exist, TP2 is the final target.
         if (entry.takeProfit3 == null && tp2HitNow) {
             return entry.copy(
                 status = TradingJournal.STATUS_TP2_FINAL,
@@ -210,11 +228,12 @@ class TradingJournalRepository(context: Context) {
             1e-12
         )
 
-        val profit = if (entry.direction == TradingJournal.DIRECTION_BUY) {
-            exitPrice - entry.entryPrice
-        } else {
-            entry.entryPrice - exitPrice
-        }
+        val profit =
+            if (entry.direction == TradingJournal.DIRECTION_BUY) {
+                exitPrice - entry.entryPrice
+            } else {
+                entry.entryPrice - exitPrice
+            }
 
         return profit / risk
     }
