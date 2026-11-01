@@ -81,10 +81,10 @@ object AnalysisEngine {
             else -> reasons += "EMA berdekatan; arah tren belum jelas."
         }
 
-        // RSI: hindari menghukum tren kuat hanya karena RSI tinggi/rendah.
+        // RSI.
         if (rsiValue != null) {
             when {
-                rsiValue >= 55.0 && rsiValue <= 70.0 -> {
+                rsiValue in 55.0..70.0 -> {
                     score += 9
                     reasons += "RSI ${"%.1f".format(rsiValue)} mendukung momentum bullish."
                 }
@@ -92,7 +92,7 @@ object AnalysisEngine {
                     score += if (bullishTrend) 3 else -3
                     reasons += "RSI ${"%.1f".format(rsiValue)} tinggi; hindari mengejar harga tanpa konfirmasi."
                 }
-                rsiValue >= 30.0 && rsiValue <= 45.0 -> {
+                rsiValue in 30.0..45.0 -> {
                     score -= 9
                     reasons += "RSI ${"%.1f".format(rsiValue)} mendukung momentum bearish."
                 }
@@ -119,7 +119,6 @@ object AnalysisEngine {
 
         val strongBullishCandle =
             atr != null && bullishCandle && body >= atr * 0.65
-
         val strongBearishCandle =
             atr != null && bearishCandle && body >= atr * 0.65
 
@@ -135,9 +134,10 @@ object AnalysisEngine {
         val highs = findPivotHighs(stable)
         val lows = findPivotLows(stable)
 
-        // Pivot yang cukup lama untuk dianggap telah terkonfirmasi.
-        val confirmedHighs = highs.filter { it.index < stable.lastIndex - 1 }
-        val confirmedLows = lows.filter { it.index < stable.lastIndex - 1 }
+        val confirmedHighs =
+            highs.filter { it.index < stable.lastIndex - 1 }
+        val confirmedLows =
+            lows.filter { it.index < stable.lastIndex - 1 }
 
         val previousHigh = confirmedHighs.lastOrNull()
         val previousLow = confirmedLows.lastOrNull()
@@ -162,7 +162,7 @@ object AnalysisEngine {
             reasons += "Belum ada breakout swing yang terkonfirmasi."
         }
 
-        // Urutan swing untuk konfirmasi struktur.
+        // Konfirmasi struktur higher high/higher low atau kebalikannya.
         val lastTwoHighs = confirmedHighs.takeLast(2)
         val lastTwoLows = confirmedLows.takeLast(2)
 
@@ -188,7 +188,7 @@ object AnalysisEngine {
             }
         }
 
-        // Volume hanya dipakai bila feed menyediakan data volume yang berguna.
+        // Volume hanya digunakan jika data volume tersedia.
         val recentVolumes = stable.takeLast(21).dropLast(1)
             .map { it.volume }
             .filter { it > 0.0 && it.isFinite() }
@@ -235,10 +235,9 @@ object AnalysisEngine {
 
         score = score.coerceIn(0, 100)
 
-        // Sinyal harus searah dengan tren atau memiliki breakout yang jelas.
+        // Sinyal harus didukung tren atau breakout yang jelas.
         val bullishSetup =
             bullishTrend || (e9 > e21 && bullishBreakout)
-
         val bearishSetup =
             bearishTrend || (e9 < e21 && bearishBreakout)
 
@@ -260,7 +259,7 @@ object AnalysisEngine {
         if (actionable && atr != null) {
             entry = last
 
-            // SL berbasis struktur swing dengan batas minimum ATR.
+            // SL mempertimbangkan struktur swing dan minimum 1,2 ATR.
             val structuralStop = if (signal == "BUY") {
                 support?.takeIf { it < entry }?.minus(atr * 0.10)
             } else {
@@ -270,14 +269,19 @@ object AnalysisEngine {
             val minimumRisk = atr * 1.2
 
             val calculatedStop = if (signal == "BUY") {
-                min(entry - minimumRisk, structuralStop ?: (entry - minimumRisk))
+                min(
+                    entry - minimumRisk,
+                    structuralStop ?: (entry - minimumRisk)
+                )
             } else {
-                max(entry + minimumRisk, structuralStop ?: (entry + minimumRisk))
+                max(
+                    entry + minimumRisk,
+                    structuralStop ?: (entry + minimumRisk)
+                )
             }
 
             val risk = abs(entry - calculatedStop)
 
-            // Hindari level yang tidak valid.
             if (risk > 0.0 && risk.isFinite()) {
                 stop = calculatedStop
 
@@ -285,8 +289,7 @@ object AnalysisEngine {
                 val target2 = entry + direction * risk * 2.0
                 val target3 = entry + direction * risk * 3.0
 
-                // Periksa ruang harga sampai resistance/support terdekat.
-                // Jika hambatan terlalu dekat, target yang melewatinya disembunyikan.
+                // Saring target berdasarkan hambatan swing terdekat.
                 val obstacle = if (signal == "BUY") {
                     resistance?.takeIf { it > entry }
                 } else {
@@ -305,8 +308,12 @@ object AnalysisEngine {
                 }
 
                 if (targetIsPlausible(target1)) tp1 = target1
-                if (tp1 != null && targetIsPlausible(target2)) tp2 = target2
-                if (tp2 != null && targetIsPlausible(target3)) tp3 = target3
+                if (tp1 != null && targetIsPlausible(target2)) {
+                    tp2 = target2
+                }
+                if (tp2 != null && targetIsPlausible(target3)) {
+                    tp3 = target3
+                }
 
                 reasons += "SL menggunakan swing terdekat bila tersedia dan jarak minimum 1,2 ATR."
                 reasons += "TP dihitung dari risiko entry ke SL: TP1 = RR 1:1, TP2 = RR 1:2, TP3 = RR 1:3."
@@ -382,7 +389,7 @@ object AnalysisEngine {
     }
 
     private fun findPivotLows(
-        candles: List<Candle,
+        candles: List<Candle>,
         radius: Int = 2
     ): List<Pivot> {
         if (candles.size < radius * 2 + 1) return emptyList()
