@@ -29,6 +29,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.flow.collectLatest
 import kotlin.math.max
 import kotlin.math.min
 
@@ -62,6 +63,10 @@ private fun LiveAnalyzerApp() {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
+    val journalRepository = remember {
+        TradingJournalRepository(context.applicationContext)
+    }
+
     var notificationsEnabled by remember {
         mutableStateOf(hasNotificationPermission(context))
     }
@@ -71,21 +76,14 @@ private fun LiveAnalyzerApp() {
     }
 
     var symbol by remember {
-        mutableStateOf(
-            prefs.getString(PREF_SYMBOL, "BTCUSD") ?: "BTCUSD"
-        )
+        mutableStateOf(prefs.getString(PREF_SYMBOL, "BTCUSD") ?: "BTCUSD")
     }
 
     var interval by remember {
-        mutableStateOf(
-            prefs.getString(PREF_INTERVAL, "1m") ?: "1m"
-        )
+        mutableStateOf(prefs.getString(PREF_INTERVAL, "1m") ?: "1m")
     }
 
-    var candles by remember {
-        mutableStateOf<List<Candle>>(emptyList())
-    }
-
+    var candles by remember { mutableStateOf<List<Candle>>(emptyList()) }
     var connected by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Menghubungkan…") }
     var refreshKey by remember { mutableIntStateOf(0) }
@@ -93,12 +91,20 @@ private fun LiveAnalyzerApp() {
     var observedSignal by remember { mutableStateOf<String?>(null) }
     var observedClosedCandleTime by remember { mutableLongStateOf(0L) }
 
+    var journalEntries by remember {
+        mutableStateOf<List<TradingJournal>>(emptyList())
+    }
+    var totalJournalCount by remember { mutableIntStateOf(0) }
+    var closedJournalCount by remember { mutableIntStateOf(0) }
+    var stopLossCount by remember { mutableIntStateOf(0) }
+    var winningCount by remember { mutableIntStateOf(0) }
+    var journalFilter by remember { mutableStateOf("PAIR AKTIF") }
+
     val notificationPermissionLauncher =
         rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestPermission()
         ) { granted ->
-            notificationsEnabled =
-                granted || Build.VERSION.SDK_INT < 33
+            notificationsEnabled = granted || Build.VERSION.SDK_INT < 33
         }
 
     LaunchedEffect(symbol, interval) {
@@ -106,6 +112,34 @@ private fun LiveAnalyzerApp() {
             .putString(PREF_SYMBOL, symbol)
             .putString(PREF_INTERVAL, interval)
             .apply()
+    }
+
+    LaunchedEffect(journalRepository) {
+        launch {
+            journalRepository.observeAll().collectLatest {
+                journalEntries = it
+            }
+        }
+        launch {
+            journalRepository.observeTotalCount().collectLatest {
+                totalJournalCount = it
+            }
+        }
+        launch {
+            journalRepository.observeClosedCount().collectLatest {
+                closedJournalCount = it
+            }
+        }
+        launch {
+            journalRepository.observeStopLossCount().collectLatest {
+                stopLossCount = it
+            }
+        }
+        launch {
+            journalRepository.observeWinningCount().collectLatest {
+                winningCount = it
+            }
+        }
     }
 
     DisposableEffect(symbol, interval, refreshKey) {
@@ -149,12 +183,9 @@ private fun LiveAnalyzerApp() {
 
         if (closedCandle.time > observedClosedCandleTime) {
             val isNewActionSignal =
-                signal in listOf("BUY", "SELL") &&
-                    signal != observedSignal
+                signal in listOf("BUY", "SELL") && signal != observedSignal
 
-            if (isNewActionSignal &&
-                hasNotificationPermission(context)
-            ) {
+            if (isNewActionSignal && hasNotificationPermission(context)) {
                 showSignalNotification(
                     context,
                     symbol,
@@ -203,7 +234,6 @@ private fun LiveAnalyzerApp() {
                             fontWeight = FontWeight.Bold,
                             letterSpacing = 2.sp
                         )
-
                         Text(
                             "AI Market Analyzer",
                             fontSize = 23.sp,
@@ -242,35 +272,20 @@ private fun LiveAnalyzerApp() {
                     )
 
                     Row(
-                        modifier = Modifier.horizontalScroll(
-                            rememberScrollState()
-                        ),
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(7.dp)
                     ) {
                         listOf(
-                            "BTCUSD",
-                            "BTCUSDT",
-                            "ETHUSDT",
-                            "BNBUSDT",
-                            "SOLUSDT",
-                            "XRPUSDT",
-                            "XAUUSD"
+                            "BTCUSD", "BTCUSDT", "ETHUSDT", "BNBUSDT",
+                            "SOLUSDT", "XRPUSDT", "XAUUSD"
                         ).forEach { pair ->
-                            Chip(pair, symbol == pair) {
-                                symbol = pair
-                            }
+                            Chip(pair, symbol == pair) { symbol = pair }
                         }
                     }
 
-                    Text(
-                        "Timeframe candle",
-                        color = Muted,
-                        fontSize = 12.sp
-                    )
+                    Text("Timeframe candle", color = Muted, fontSize = 12.sp)
 
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(7.dp)
-                    ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                         listOf("1m", "5m", "15m", "1h").forEach { timeframe ->
                             Chip(timeframe, interval == timeframe) {
                                 interval = timeframe
@@ -280,25 +295,17 @@ private fun LiveAnalyzerApp() {
                 }
 
                 PanelCard {
+                    Text(symbol, color = Muted, fontSize = 13.sp)
                     Text(
-                        symbol,
-                        color = Muted,
-                        fontSize = 13.sp
-                    )
-
-                    Text(
-                        lastPrice?.let(::price)
-                            ?: "Menunggu data…",
+                        lastPrice?.let(::price) ?: "Menunggu data…",
                         fontSize = 29.sp,
                         fontWeight = FontWeight.Bold
                     )
-
                     Text(
                         status,
                         color = if (connected) Green else Amber,
                         fontSize = 11.sp
                     )
-
                     Spacer(Modifier.height(4.dp))
 
                     if (symbol == "XAUUSD" && !connected) {
@@ -310,20 +317,14 @@ private fun LiveAnalyzerApp() {
                         )
                     } else {
                         CandleChart(
-                            Modifier
-                                .fillMaxWidth()
-                                .height(145.dp),
+                            Modifier.fillMaxWidth().height(145.dp),
                             candles.takeLast(70)
                         )
-
                         Text(
                             when (symbol) {
-                                "BTCUSD" ->
-                                    "Harga BTC/USD • sumber Bitstamp • candle tertutup untuk analisis"
-                                "XAUUSD" ->
-                                    "Harga emas • sumber Biquote • candle tertutup untuk analisis"
-                                else ->
-                                    "Harga crypto • sumber Binance • candle tertutup untuk analisis"
+                                "BTCUSD" -> "Harga BTC/USD • sumber Bitstamp • candle tertutup untuk analisis"
+                                "XAUUSD" -> "Harga emas • sumber Biquote • candle tertutup untuk analisis"
+                                else -> "Harga crypto • sumber Binance • candle tertutup untuk analisis"
                             },
                             color = Muted,
                             fontSize = 11.sp
@@ -337,11 +338,7 @@ private fun LiveAnalyzerApp() {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            "AUTO SIGNAL",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 16.sp
-                        )
+                        Text("AUTO SIGNAL", fontWeight = FontWeight.Bold, fontSize = 16.sp)
 
                         val shownSignal =
                             if (symbol == "XAUUSD" && !connected) {
@@ -360,10 +357,7 @@ private fun LiveAnalyzerApp() {
                         ) {
                             Text(
                                 shownSignal,
-                                modifier = Modifier.padding(
-                                    horizontal = 12.dp,
-                                    vertical = 8.dp
-                                ),
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                                 color = when (shownSignal) {
                                     "BUY" -> Green
                                     "SELL" -> Red
@@ -395,21 +389,14 @@ private fun LiveAnalyzerApp() {
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Metric(
-                                "RSI 14",
-                                result.rsi?.let { "%.1f".format(it) } ?: "—"
-                            )
+                            Metric("RSI 14", result.rsi?.let { "%.1f".format(it) } ?: "—")
                             Metric("EMA 9", result.ema9?.let(::price) ?: "—")
                             Metric("EMA 21", result.ema21?.let(::price) ?: "—")
                             Metric("EMA 50", result.ema50?.let(::price) ?: "—")
                         }
 
                         HorizontalDivider(color = Color(0xFF283448))
-
-                        Text(
-                            "Alasan sinyal",
-                            fontWeight = FontWeight.Bold
-                        )
+                        Text("Alasan sinyal", fontWeight = FontWeight.Bold)
 
                         result.reasons.forEach { reason ->
                             Text(
@@ -422,57 +409,30 @@ private fun LiveAnalyzerApp() {
 
                         val waiting = result.signal == "WAIT"
 
-                        Text(
-                            "LEVEL ENTRY & TARGET",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
-                        )
+                        Text("LEVEL ENTRY & TARGET", fontWeight = FontWeight.Bold, fontSize = 14.sp)
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Metric(
-                                "Entry",
-                                if (waiting) "WAIT"
-                                else result.entryPrice?.let(::price) ?: "—"
-                            )
-                            Metric(
-                                "Stop Loss",
-                                if (waiting) "WAIT"
-                                else result.stopLoss?.let(::price) ?: "—"
-                            )
+                            Metric("Entry", if (waiting) "WAIT" else result.entryPrice?.let(::price) ?: "—")
+                            Metric("Stop Loss", if (waiting) "WAIT" else result.stopLoss?.let(::price) ?: "—")
                         }
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Metric(
-                                "TP 1",
-                                if (waiting) "WAIT"
-                                else result.takeProfit1?.let(::price) ?: "—"
-                            )
-                            Metric(
-                                "TP 2",
-                                if (waiting) "WAIT"
-                                else result.takeProfit2?.let(::price) ?: "—"
-                            )
-                            Metric(
-                                "TP 3",
-                                if (waiting) "WAIT"
-                                else result.takeProfit3?.let(::price) ?: "—"
-                            )
+                            Metric("TP 1", if (waiting) "WAIT" else result.takeProfit1?.let(::price) ?: "—")
+                            Metric("TP 2", if (waiting) "WAIT" else result.takeProfit2?.let(::price) ?: "—")
+                            Metric("TP 3", if (waiting) "WAIT" else result.takeProfit3?.let(::price) ?: "—")
                         }
 
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Metric(
-                                "ATR 14",
-                                result.atr?.let(::price) ?: "—"
-                            )
+                            Metric("ATR 14", result.atr?.let(::price) ?: "—")
                         }
 
                         Text(
@@ -487,49 +447,115 @@ private fun LiveAnalyzerApp() {
                     }
                 }
 
+                // TRADING JOURNAL
+                PanelCard {
+                    Text(
+                        "TRADING JOURNAL",
+                        color = Green,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                    Text(
+                        "Riwayat sinyal virtual dari database lokal di HP.",
+                        color = Muted,
+                        fontSize = 11.sp
+                    )
+
+                    val winRate = if (closedJournalCount > 0) {
+                        winningCount * 100.0 / closedJournalCount
+                    } else {
+                        0.0
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        JournalStat("TOTAL", totalJournalCount.toString(), Green, Modifier.weight(1f))
+                        JournalStat(
+                            "OPEN",
+                            (totalJournalCount - closedJournalCount).coerceAtLeast(0).toString(),
+                            Amber,
+                            Modifier.weight(1f)
+                        )
+                        JournalStat("SELESAI", closedJournalCount.toString(), Color.White, Modifier.weight(1f))
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        JournalStat("MENANG", winningCount.toString(), Green, Modifier.weight(1f))
+                        JournalStat("STOP LOSS", stopLossCount.toString(), Red, Modifier.weight(1f))
+                        JournalStat("WIN RATE", "%.1f%%".format(winRate), Amber, Modifier.weight(1f))
+                    }
+
+                    Text("Filter riwayat", color = Muted, fontSize = 12.sp)
+
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        Chip("PAIR AKTIF", journalFilter == "PAIR AKTIF") {
+                            journalFilter = "PAIR AKTIF"
+                        }
+                        Chip("SEMUA PAIR", journalFilter == "SEMUA PAIR") {
+                            journalFilter = "SEMUA PAIR"
+                        }
+                    }
+
+                    val filteredEntries = journalEntries.filter {
+                        journalFilter == "SEMUA PAIR" || it.symbol == symbol
+                    }
+
+                    if (filteredEntries.isEmpty()) {
+                        Text(
+                            "Belum ada catatan sinyal untuk filter ini. Sinyal BUY/SELL akan tampil jika layanan pencatatan berhasil menyimpannya.",
+                            color = Muted,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp
+                        )
+                    } else {
+                        filteredEntries.take(50).forEach { entry ->
+                            JournalEntryCard(entry)
+                        }
+
+                        if (filteredEntries.size > 50) {
+                            Text(
+                                "Menampilkan 50 catatan terbaru dari ${filteredEntries.size} catatan.",
+                                color = Muted,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                }
+
                 Button(
                     onClick = { refreshKey++ },
                     modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF17382F)
-                    )
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF17382F))
                 ) {
                     Text("Reconnect / Refresh data", color = Green)
                 }
 
                 Button(
                     onClick = {
-                        if (Build.VERSION.SDK_INT >= 33 &&
-                            !hasNotificationPermission(context)
-                        ) {
-                            notificationPermissionLauncher.launch(
-                                Manifest.permission.POST_NOTIFICATIONS
-                            )
+                        if (Build.VERSION.SDK_INT >= 33 && !hasNotificationPermission(context)) {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         } else {
                             val intent = android.content.Intent(
                                 context,
                                 BackgroundSignalService::class.java
-                            ).putExtra(
-                                BackgroundSignalService.EXTRA_SYMBOL,
-                                symbol
-                            ).putExtra(
-                                BackgroundSignalService.EXTRA_INTERVAL,
-                                interval
-                            )
+                            ).putExtra(BackgroundSignalService.EXTRA_SYMBOL, symbol)
+                                .putExtra(BackgroundSignalService.EXTRA_INTERVAL, interval)
 
                             if (backgroundEnabled) {
-                                intent.action =
-                                    BackgroundSignalService.ACTION_STOP
+                                intent.action = BackgroundSignalService.ACTION_STOP
                                 context.startService(intent)
                                 backgroundEnabled = false
-                                prefs.edit()
-                                    .putBoolean("enabled", false)
-                                    .apply()
+                                prefs.edit().putBoolean("enabled", false).apply()
                             } else {
-                                ContextCompat.startForegroundService(
-                                    context,
-                                    intent
-                                )
+                                ContextCompat.startForegroundService(context, intent)
                                 backgroundEnabled = true
                                 prefs.edit()
                                     .putBoolean("enabled", true)
@@ -541,19 +567,12 @@ private fun LiveAnalyzerApp() {
                     },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (backgroundEnabled) {
-                            Color(0xFF4A2530)
-                        } else {
-                            Color(0xFF17382F)
-                        }
+                        containerColor = if (backgroundEnabled) Color(0xFF4A2530) else Color(0xFF17382F)
                     )
                 ) {
                     Text(
-                        if (backgroundEnabled) {
-                            "Hentikan pemantauan latar belakang"
-                        } else {
-                            "Mulai pemantauan latar belakang (15 detik)"
-                        },
+                        if (backgroundEnabled) "Hentikan pemantauan latar belakang"
+                        else "Mulai pemantauan latar belakang (15 detik)",
                         color = if (backgroundEnabled) Red else Green
                     )
                 }
@@ -567,27 +586,18 @@ private fun LiveAnalyzerApp() {
 
                 Button(
                     onClick = {
-                        if (Build.VERSION.SDK_INT >= 33 &&
-                            !hasNotificationPermission(context)
-                        ) {
-                            notificationPermissionLauncher.launch(
-                                Manifest.permission.POST_NOTIFICATIONS
-                            )
+                        if (Build.VERSION.SDK_INT >= 33 && !hasNotificationPermission(context)) {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         } else {
                             notificationsEnabled = true
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF17382F)
-                    )
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF17382F))
                 ) {
                     Text(
-                        if (notificationsEnabled) {
-                            "Notifikasi BUY / SELL aktif ✓"
-                        } else {
-                            "Aktifkan notifikasi BUY / SELL"
-                        },
+                        if (notificationsEnabled) "Notifikasi BUY / SELL aktif ✓"
+                        else "Aktifkan notifikasi BUY / SELL",
                         color = Green
                     )
                 }
@@ -617,6 +627,168 @@ private fun LiveAnalyzerApp() {
 }
 
 @Composable
+private fun JournalStat(
+    label: String,
+    value: String,
+    color: Color,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        color = Color(0xFF182338),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 11.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Text(label, color = Muted, fontSize = 9.sp, fontWeight = FontWeight.Bold)
+            Text(value, color = color, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
+        }
+    }
+}
+
+@Composable
+private fun JournalEntryCard(entry: TradingJournal) {
+    val isWin = entry.status == TradingJournal.STATUS_TP3 ||
+        entry.status == TradingJournal.STATUS_TP2_FINAL ||
+        entry.status == TradingJournal.STATUS_TP1_FINAL
+
+    val statusColor = when {
+        entry.status == TradingJournal.STATUS_OPEN -> Amber
+        entry.status == TradingJournal.STATUS_SL -> Red
+        isWin -> Green
+        else -> Muted
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = Color(0xFF0C1423),
+        shape = RoundedCornerShape(13.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        "${entry.symbol} • ${entry.timeframe}",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                    Text(
+                        "${entry.direction} • Skor ${entry.score}/100",
+                        color = if (entry.direction == "BUY") Green else Red,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Surface(
+                    color = statusColor.copy(alpha = 0.13f),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Text(
+                        displayJournalStatus(entry),
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                        color = statusColor,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+            }
+
+            HorizontalDivider(color = Color(0xFF283448))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Metric("ENTRY", price(entry.entryPrice))
+                Metric("STOP LOSS", price(entry.stopLoss))
+                Metric("TP 1", price(entry.takeProfit1))
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Metric("TP 2", price(entry.takeProfit2))
+                Metric("TP 3", entry.takeProfit3?.let(::price) ?: "—")
+                Metric("HASIL (R)", entry.resultR?.let { "%+.2fR".format(it) } ?: "—")
+            }
+
+            Text(
+                "Sinyal: ${formatJournalTime(entry.signalTime)}",
+                color = Muted,
+                fontSize = 10.sp
+            )
+
+            if (entry.exitTime != null) {
+                Text(
+                    "Selesai: ${formatJournalTime(entry.exitTime)}",
+                    color = Muted,
+                    fontSize = 10.sp
+                )
+            }
+
+            val targets = buildList {
+                add(if (entry.tp1Hit) "TP1 ✓" else "TP1 —")
+                add(if (entry.tp2Hit) "TP2 ✓" else "TP2 —")
+                if (entry.takeProfit3 != null) {
+                    add(if (entry.tp3Hit) "TP3 ✓" else "TP3 —")
+                }
+            }
+
+            Text(
+                targets.joinToString("   "),
+                color = if (entry.tp1Hit || entry.tp2Hit || entry.tp3Hit) Green else Muted,
+                fontSize = 10.sp
+            )
+
+            if (!entry.note.isNullOrBlank()) {
+                Text(entry.note, color = Amber, fontSize = 10.sp)
+            }
+        }
+    }
+}
+
+private fun displayJournalStatus(entry: TradingJournal): String {
+    return when (entry.status) {
+        TradingJournal.STATUS_OPEN -> {
+            when {
+                entry.tp3Hit -> "TP3 TERCAPAI"
+                entry.tp2Hit -> "TP2 TERCAPAI"
+                entry.tp1Hit -> "TP1 TERCAPAI"
+                else -> "OPEN"
+            }
+        }
+        TradingJournal.STATUS_TP3 -> "TP3 SELESAI"
+        TradingJournal.STATUS_TP2_FINAL -> "TP2 SELESAI"
+        TradingJournal.STATUS_TP1_FINAL -> "TP1 SELESAI"
+        TradingJournal.STATUS_SL -> "STOP LOSS"
+        TradingJournal.STATUS_CANCELLED -> "DIBATALKAN"
+        else -> entry.status
+    }
+}
+
+private fun formatJournalTime(time: Long): String {
+    return try {
+        java.text.SimpleDateFormat(
+            "dd MMM yyyy, HH:mm",
+            java.util.Locale.getDefault()
+        ).format(java.util.Date(time))
+    } catch (_: Exception) {
+        time.toString()
+    }
+}
+
+@Composable
 private fun Chip(
     label: String,
     selected: Boolean,
@@ -636,9 +808,7 @@ private fun Chip(
 }
 
 @Composable
-private fun PanelCard(
-    content: @Composable ColumnScope.() -> Unit
-) {
+private fun PanelCard(content: @Composable ColumnScope.() -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
@@ -661,10 +831,7 @@ private fun Metric(label: String, value: String) {
 }
 
 @Composable
-private fun CandleChart(
-    modifier: Modifier,
-    data: List<Candle>
-) {
+private fun CandleChart(modifier: Modifier, data: List<Candle>) {
     Canvas(modifier) {
         if (data.isEmpty()) return@Canvas
 
@@ -719,8 +886,7 @@ private fun createSignalNotificationChannel(context: Context) {
             "Sinyal BUY / SELL",
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description =
-                "Peringatan saat sinyal crypto berubah menjadi BUY atau SELL baru"
+            description = "Peringatan saat sinyal crypto berubah menjadi BUY atau SELL baru"
         }
 
         manager.createNotificationChannel(channel)
@@ -750,13 +916,11 @@ private fun showSignalNotification(
     ) as NotificationManager
 
     val currency = when (symbol) {
-        "BTCUSD" -> "USD"
-        "XAUUSD" -> "USD"
+        "BTCUSD", "XAUUSD" -> "USD"
         else -> "USDT"
     }
 
-    val body =
-        "$symbol • $interval • skor $score/100 • harga ${price(currentPrice)} $currency"
+    val body = "$symbol • $interval • skor $score/100 • harga ${price(currentPrice)} $currency"
 
     val notification =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
