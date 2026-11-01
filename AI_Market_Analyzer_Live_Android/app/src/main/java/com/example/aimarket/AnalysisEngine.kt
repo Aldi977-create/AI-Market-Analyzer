@@ -57,7 +57,6 @@ object AnalysisEngine {
         val reasons = mutableListOf<String>()
         var score = 50
 
-        // Arah tren utama.
         val bullishTrend = e9 > e21 && e21 > e50
         val bearishTrend = e9 < e21 && e21 < e50
 
@@ -81,7 +80,6 @@ object AnalysisEngine {
             else -> reasons += "EMA berdekatan; arah tren belum jelas."
         }
 
-        // RSI.
         if (rsiValue != null) {
             when {
                 rsiValue in 55.0..70.0 -> {
@@ -112,7 +110,6 @@ object AnalysisEngine {
             reasons += "MACD line berada di bawah nol."
         }
 
-        // Momentum candle dibandingkan ATR.
         val body = abs(lastCandle.close - lastCandle.open)
         val bullishCandle = lastCandle.close > lastCandle.open
         val bearishCandle = lastCandle.close < lastCandle.open
@@ -130,7 +127,6 @@ object AnalysisEngine {
             reasons += "Candle bearish memiliki body besar relatif terhadap ATR."
         }
 
-        // Struktur swing dan breakout.
         val highs = findPivotHighs(stable)
         val lows = findPivotLows(stable)
 
@@ -162,7 +158,6 @@ object AnalysisEngine {
             reasons += "Belum ada breakout swing yang terkonfirmasi."
         }
 
-        // Konfirmasi struktur higher high/higher low atau kebalikannya.
         val lastTwoHighs = confirmedHighs.takeLast(2)
         val lastTwoLows = confirmedLows.takeLast(2)
 
@@ -188,7 +183,6 @@ object AnalysisEngine {
             }
         }
 
-        // Volume hanya digunakan jika data volume tersedia.
         val recentVolumes = stable.takeLast(21).dropLast(1)
             .map { it.volume }
             .filter { it > 0.0 && it.isFinite() }
@@ -212,7 +206,6 @@ object AnalysisEngine {
             }
         }
 
-        // Support dan resistance dari pivot terkonfirmasi.
         val support = confirmedLows.lastOrNull {
             it.price < last
         }?.price
@@ -235,7 +228,7 @@ object AnalysisEngine {
 
         score = score.coerceIn(0, 100)
 
-        // Sinyal harus didukung tren atau breakout yang jelas.
+        // Filter sinyal asli tetap dipertahankan.
         val bullishSetup =
             bullishTrend || (e9 > e21 && bullishBreakout)
         val bearishSetup =
@@ -259,78 +252,78 @@ object AnalysisEngine {
         if (actionable && atr != null) {
             entry = last
 
-            // SL mempertimbangkan struktur swing dan minimum 1,2 ATR.
             val structuralStop = if (signal == "BUY") {
-                support?.takeIf { it < entry }?.minus(atr * 0.10)
+                support?.takeIf { it < last }?.minus(atr * 0.10)
             } else {
-                resistance?.takeIf { it > entry }?.plus(atr * 0.10)
+                resistance?.takeIf { it > last }?.plus(atr * 0.10)
             }
 
             val minimumRisk = atr * 1.2
 
             val calculatedStop = if (signal == "BUY") {
                 min(
-                    entry - minimumRisk,
-                    structuralStop ?: (entry - minimumRisk)
+                    last - minimumRisk,
+                    structuralStop ?: (last - minimumRisk)
                 )
             } else {
                 max(
-                    entry + minimumRisk,
-                    structuralStop ?: (entry + minimumRisk)
+                    last + minimumRisk,
+                    structuralStop ?: (last + minimumRisk)
                 )
             }
 
-            val risk = abs(entry - calculatedStop)
+            val risk = abs(last - calculatedStop)
 
             if (risk > 0.0 && risk.isFinite()) {
                 stop = calculatedStop
 
-                val target1 = entry + direction * risk
-                val target2 = entry + direction * risk * 2.0
-                val target3 = entry + direction * risk * 3.0
+                // TP1 dan TP2 selalu dihitung dari risiko yang sama.
+                val target1 = last + direction * risk
+                val target2 = last + direction * risk * 2.0
+                val target3 = last + direction * risk * 3.0
 
-                // Saring target berdasarkan hambatan swing terdekat.
+                tp1 = target1
+                tp2 = target2
+
                 val obstacle = if (signal == "BUY") {
-                    resistance?.takeIf { it > entry }
+                    resistance?.takeIf { it > last }
                 } else {
-                    support?.takeIf { it < entry }
+                    support?.takeIf { it < last }
                 }
 
-                fun targetIsPlausible(target: Double): Boolean {
-                    if (obstacle == null) return true
-
+                // TP3 hanya ditampilkan jika ruang menuju target cukup.
+                val target3IsPlausible = if (obstacle == null) {
+                    true
+                } else {
                     val buffer = atr * 0.10
-                    return if (signal == "BUY") {
-                        target <= obstacle + buffer
+                    if (signal == "BUY") {
+                        target3 <= obstacle + buffer
                     } else {
-                        target >= obstacle - buffer
+                        target3 >= obstacle - buffer
                     }
                 }
 
-                if (targetIsPlausible(target1)) tp1 = target1
-                if (tp1 != null && targetIsPlausible(target2)) {
-                    tp2 = target2
-                }
-                if (tp2 != null && targetIsPlausible(target3)) {
+                if (target3IsPlausible) {
                     tp3 = target3
                 }
 
-                reasons += "SL menggunakan swing terdekat bila tersedia dan jarak minimum 1,2 ATR."
-                reasons += "TP dihitung dari risiko entry ke SL: TP1 = RR 1:1, TP2 = RR 1:2, TP3 = RR 1:3."
-                reasons += if (obstacle != null) {
-                    "Target yang melewati resistance/support terdekat disaring. Target tidak dijamin tercapai."
+                reasons += "SL menggunakan minimum 1,2 ATR dan swing terdekat bila tersedia."
+                reasons += "TP1 = RR 1:1 dan TP2 = RR 1:2; keduanya dihitung dari risiko entry ke SL."
+
+                if (obstacle != null) {
+                    val distanceToObstacle = abs(obstacle - last)
+                    reasons += "Terdapat support/resistance terdekat pada ${"%.5f".format(obstacle)}."
+                    if (distanceToObstacle < risk * 2.0) {
+                        reasons += "Peringatan: hambatan harga berada sebelum atau dekat TP2. TP tetap estimasi, bukan jaminan tercapai."
+                    } else {
+                        reasons += "Hambatan swing terdekat sudah diperiksa; target tetap estimasi."
+                    }
                 } else {
-                    "Belum ada hambatan swing terdekat yang terdeteksi; target tetap bersifat estimasi."
+                    reasons += "Belum ada hambatan swing terdekat yang terdeteksi; target tetap estimasi."
                 }
 
-                if (tp1 == null) {
-                    reasons += "TP1 tidak ditampilkan karena ruang harga menuju target belum memadai."
-                }
-                if (tp1 != null && tp2 == null) {
-                    reasons += "TP2 tidak ditampilkan karena ruang harga menuju target belum memadai."
-                }
-                if (tp2 != null && tp3 == null) {
-                    reasons += "TP3 tidak ditampilkan karena ruang harga menuju target belum memadai."
+                if (tp3 == null) {
+                    reasons += "TP3 disembunyikan karena ruang menuju target belum memadai."
                 }
             }
         }
