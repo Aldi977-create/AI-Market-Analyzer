@@ -22,8 +22,13 @@ class LiveMarketRepository(
 
     private val main = Handler(Looper.getMainLooper())
 
+    @Volatile
     private var socket: okhttp3.WebSocket? = null
+
+    @Volatile
     private var currentSymbol = "BTCUSDT"
+
+    @Volatile
     private var currentInterval = "1m"
 
     private val candles = mutableListOf<Candle>()
@@ -48,33 +53,41 @@ class LiveMarketRepository(
 
         when (currentSymbol) {
             "XAUUSD" -> {
-                publish(false, "Menghubungkan ke feed XAUUSD…")
+                publish(
+                    myGeneration,
+                    false,
+                    "Menghubungkan ke feed XAUUSD…"
+                )
                 startGoldFeed(myGeneration)
             }
 
             "BTCUSD" -> {
-                publish(false, "Menghubungkan ke Bitstamp BTC/USD…")
+                publish(
+                    myGeneration,
+                    false,
+                    "Menghubungkan ke Bitstamp BTC/USD…"
+                )
                 startBitstampFeed(myGeneration)
             }
 
             else -> {
-                publish(false, "Memuat candle historis Binance…")
+                publish(
+                    myGeneration,
+                    false,
+                    "Memuat candle historis Binance…"
+                )
                 startBinanceFeed(myGeneration)
             }
         }
     }
-
-    // ---------------------------------------------------------
-    // BINANCE: BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT
-    // ---------------------------------------------------------
 
     private fun startBinanceFeed(myGeneration: Int) {
         Thread {
             try {
                 val url =
                     "https://api.binance.com/api/v3/klines" +
-                    "?symbol=$currentSymbol" +
-                    "&interval=$currentInterval&limit=120"
+                        "?symbol=$currentSymbol" +
+                        "&interval=$currentInterval&limit=120"
 
                 val request = Request.Builder()
                     .url(url)
@@ -91,6 +104,7 @@ class LiveMarketRepository(
 
                     for (i in 0 until arr.length()) {
                         val k = arr.getJSONArray(i)
+                        val closeTime = k.getLong(6)
 
                         parsed.add(
                             Candle(
@@ -100,7 +114,7 @@ class LiveMarketRepository(
                                 low = k.getString(3).toDouble(),
                                 close = k.getString(4).toDouble(),
                                 volume = k.getString(5).toDouble(),
-                                closed = k.getLong(6) < System.currentTimeMillis()
+                                closed = closeTime < System.currentTimeMillis()
                             )
                         )
                     }
@@ -115,12 +129,13 @@ class LiveMarketRepository(
 
                 if (!isCurrent(myGeneration)) return@Thread
 
-                publish(true, "LIVE • Binance")
+                publish(myGeneration, true, "LIVE • Binance")
                 connectSocket(myGeneration)
 
             } catch (e: Exception) {
                 if (isCurrent(myGeneration)) {
                     publish(
+                        myGeneration,
                         false,
                         "Binance gagal: ${e.message ?: "periksa internet"}"
                     )
@@ -148,7 +163,13 @@ class LiveMarketRepository(
                     response: okhttp3.Response
                 ) {
                     if (isCurrent(myGeneration)) {
-                        publish(true, "LIVE • Binance WebSocket")
+                        publish(
+                            myGeneration,
+                            true,
+                            "LIVE • Binance WebSocket"
+                        )
+                    } else {
+                        webSocket.close(1000, "Koneksi sudah diganti")
                     }
                 }
 
@@ -190,6 +211,7 @@ class LiveMarketRepository(
                         }
 
                         publish(
+                            myGeneration,
                             true,
                             if (candle.closed) {
                                 "LIVE • Binance • candle ditutup"
@@ -198,7 +220,11 @@ class LiveMarketRepository(
                             }
                         )
                     } catch (_: Exception) {
-                        publish(false, "Data Binance tidak dapat dibaca")
+                        publish(
+                            myGeneration,
+                            false,
+                            "Data Binance tidak dapat dibaca"
+                        )
                     }
                 }
 
@@ -210,6 +236,7 @@ class LiveMarketRepository(
                     if (!isCurrent(myGeneration)) return
 
                     publish(
+                        myGeneration,
                         false,
                         "Koneksi Binance terputus: " +
                             (t.message ?: "mencoba kembali")
@@ -229,7 +256,11 @@ class LiveMarketRepository(
                 ) {
                     if (!isCurrent(myGeneration)) return
 
-                    publish(false, "Koneksi Binance ditutup")
+                    publish(
+                        myGeneration,
+                        false,
+                        "Koneksi Binance ditutup"
+                    )
 
                     main.postDelayed({
                         if (isCurrent(myGeneration)) {
@@ -241,20 +272,16 @@ class LiveMarketRepository(
         )
     }
 
-    // ---------------------------------------------------------
-    // BITSTAMP: BTCUSD
-    // Uses public REST ticker + OHLC polling.
-    // ---------------------------------------------------------
-
     private fun startBitstampFeed(myGeneration: Int) {
         Thread {
             while (isCurrent(myGeneration)) {
                 try {
                     val step = intervalToSeconds(currentInterval)
+                    val stepMs = step * 1000L
 
                     val ohlcUrl =
                         "https://www.bitstamp.net/api/v2/ohlc/btcusd/" +
-                        "?step=$step&limit=120"
+                            "?step=$step&limit=120"
 
                     val ohlcRoot = getJson(ohlcUrl)
 
@@ -279,11 +306,12 @@ class LiveMarketRepository(
                         )
 
                     if (!lastPrice.isFinite() || lastPrice <= 0.0) {
-                        throw IllegalStateException("Harga BTCUSD tidak valid")
+                        throw IllegalStateException(
+                            "Harga BTCUSD tidak valid"
+                        )
                     }
 
                     val now = System.currentTimeMillis()
-                    val stepMs = step * 1000L
                     val parsed = mutableListOf<Candle>()
 
                     for (i in 0 until bars.length()) {
@@ -314,12 +342,11 @@ class LiveMarketRepository(
                             open <= 0.0 ||
                             high <= 0.0 ||
                             low <= 0.0 ||
-                            close <= 0.0
+                            close <= 0.0 ||
+                            high < low
                         ) {
                             continue
                         }
-
-                        val isClosed = time + stepMs <= now
 
                         parsed.add(
                             Candle(
@@ -329,7 +356,7 @@ class LiveMarketRepository(
                                 low = low,
                                 close = close,
                                 volume = volume,
-                                closed = isClosed
+                                closed = time + stepMs <= now
                             )
                         )
                     }
@@ -340,8 +367,9 @@ class LiveMarketRepository(
                         )
                     }
 
-                    // Sinkronkan candle yang sedang berjalan dengan
-                    // ticker terbaru. Jangan mengubah candle yang sudah tutup.
+                    parsed.sortBy { it.time }
+
+                    // Cari candle yang sedang berjalan berdasarkan waktu lokal.
                     val currentBucket = (now / stepMs) * stepMs
                     val currentIndex =
                         parsed.indexOfLast { it.time == currentBucket }
@@ -358,25 +386,44 @@ class LiveMarketRepository(
                             volume = old.volume,
                             closed = false
                         )
+                    } else {
+                        // Jika Bitstamp belum mengembalikan candle saat ini,
+                        // buat candle sementara dari harga penutupan sebelumnya
+                        // dan harga ticker terbaru.
+                        val previousClose = parsed.last().close
+
+                        val liveCandle = Candle(
+                            time = currentBucket,
+                            open = previousClose,
+                            high = maxOf(previousClose, lastPrice),
+                            low = minOf(previousClose, lastPrice),
+                            close = lastPrice,
+                            volume = 0.0,
+                            closed = false
+                        )
+
+                        parsed.add(liveCandle)
+                        parsed.sortBy { it.time }
                     }
 
                     if (!isCurrent(myGeneration)) return@Thread
 
                     synchronized(candles) {
                         candles.clear()
-                        candles.addAll(parsed.sortedBy { it.time }.takeLast(300))
+                        candles.addAll(parsed.takeLast(300))
                     }
 
-                    publish(true, "LIVE • BTC/USD • Bitstamp REST")
+                    publish(
+                        myGeneration,
+                        true,
+                        "LIVE • BTC/USD • Bitstamp REST"
+                    )
 
                 } catch (e: Exception) {
                     if (!isCurrent(myGeneration)) return@Thread
 
-                    synchronized(candles) {
-                        candles.clear()
-                    }
-
                     publish(
+                        myGeneration,
                         false,
                         "BTCUSD Bitstamp tidak tersedia: " +
                             (e.message ?: "periksa koneksi")
@@ -402,10 +449,6 @@ class LiveMarketRepository(
         }
     }
 
-    // ---------------------------------------------------------
-    // XAUUSD: Biquote feed
-    // ---------------------------------------------------------
-
     private fun startGoldFeed(myGeneration: Int) {
         Thread {
             while (isCurrent(myGeneration)) {
@@ -426,6 +469,7 @@ class LiveMarketRepository(
                         }
 
                         publish(
+                            myGeneration,
                             false,
                             "MARKET TUTUP / DATA KEDALUWARSA • " +
                                 "chart dan sinyal disembunyikan"
@@ -465,7 +509,8 @@ class LiveMarketRepository(
                                 !open.isFinite() ||
                                 !high.isFinite() ||
                                 !low.isFinite() ||
-                                !close.isFinite()
+                                !close.isFinite() ||
+                                high < low
                             ) {
                                 continue
                             }
@@ -496,6 +541,7 @@ class LiveMarketRepository(
                             }
 
                             publish(
+                                myGeneration,
                                 false,
                                 "Feed XAUUSD aktif, candle belum tersedia"
                             )
@@ -505,19 +551,21 @@ class LiveMarketRepository(
                                 candles.addAll(sorted.takeLast(300))
                             }
 
-                            publish(true, "LIVE • XAUUSD via Biquote")
+                            publish(
+                                myGeneration,
+                                true,
+                                "LIVE • XAUUSD via Biquote"
+                            )
                         }
                     }
                 } catch (e: Exception) {
                     if (!isCurrent(myGeneration)) return@Thread
 
-                    synchronized(candles) {
-                        candles.clear()
-                    }
-
                     publish(
+                        myGeneration,
                         false,
-                        "XAUUSD tidak tersedia • chart disembunyikan"
+                        "XAUUSD tidak tersedia • " +
+                            (e.message ?: "periksa koneksi")
                     )
                 }
 
@@ -529,10 +577,6 @@ class LiveMarketRepository(
             }
         }.start()
     }
-
-    // ---------------------------------------------------------
-    // Shared helpers
-    // ---------------------------------------------------------
 
     private fun getJson(url: String): JSONObject {
         val request = Request.Builder()
@@ -554,12 +598,14 @@ class LiveMarketRepository(
         return !stopped && generation.get() == myGeneration
     }
 
-    private fun publish(live: Boolean, status: String) {
+    private fun publish(
+        myGeneration: Int,
+        live: Boolean,
+        status: String
+    ) {
         val snapshot = synchronized(candles) {
             candles.toList()
         }
-
-        val myGeneration = generation.get()
 
         main.post {
             if (isCurrent(myGeneration)) {
