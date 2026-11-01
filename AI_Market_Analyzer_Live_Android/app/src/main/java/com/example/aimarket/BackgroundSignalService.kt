@@ -18,6 +18,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.Locale
 
 class BackgroundSignalService : Service() {
@@ -26,6 +28,8 @@ class BackgroundSignalService : Service() {
 
     private val serviceScope =
         CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val processingMutex = Mutex()
 
     private lateinit var journal: TradingJournalRepository
 
@@ -94,122 +98,120 @@ class BackgroundSignalService : Service() {
                 return@LiveMarketRepository
             }
 
-            val closedCandles = candles
-                .filter { it.closed }
-                .sortedBy { it.time }
-
-            if (closedCandles.isEmpty()) {
-                return@LiveMarketRepository
-            }
-
-            // Evaluasi hasil entry lama pada candle yang sudah tertutup.
-            for (candle in closedCandles) {
-                serviceScope.launch {
+            // Semua pemrosesan candle diserialkan agar urutannya terjaga.
+            serviceScope.launch {
+                processingMutex.withLock {
                     try {
-                        journal.processClosedCandle(
+                        val closedCandles = candles
+                            .filter { it.closed }
+                            .sortedBy { it.time }
+
+                        if (closedCandles.isEmpty()) {
+                            return@withLock
+                        }
+
+                        // Proses candle lama satu per satu.
+                        for (candle in closedCandles) {
+                            if (candle.time <= lastClosedTime) {
+                                continue
+                            }
+
+                            journal.processClosedCandle(
+                                symbol = symbol,
+                                timeframe = interval,
+                                candleTime = candle.time,
+                                high = candle.high,
+                                low = candle.low
+                            )
+
+                            lastClosedTime = candle.time
+                        }
+
+                        val newestClosed = closedCandles.last()
+
+                        val analysis =
+                            AnalysisEngine.analyze(closedCandles)
+                                ?: return@withLock
+
+                        val signal =
+                            analysis.signal.uppercase(Locale.US)
+
+                        if (signal != "BUY" && signal != "SELL") {
+                            lastSignal = signal
+                            return@withLock
+                        }
+
+                        // Hindari sinyal yang sama berulang pada candle berikutnya.
+                        if (signal == lastSignal) {
+                            return@withLock
+                        }
+
+                        val entry =
+                            analysis.entryPrice ?: analysis.lastPrice
+
+                        val sl = analysis.stopLoss
+                        val tp1 = analysis.takeProfit1
+                        val tp2 = analysis.takeProfit2
+                        val tp3 = analysis.takeProfit3
+
+                        if (
+                            !entry.isFinite() || entry <= 0.0 ||
+                            sl == null || !sl.isFinite() ||
+                            tp1 == null || !tp1.isFinite() ||
+                            tp2 == null || !tp2.isFinite()
+                        ) {
+                            lastSignal = signal
+                            updateStatus("Level sinyal $signal tidak valid")
+                            return@withLock
+                        }
+
+                        val insertedId = journal.recordSignal(
                             symbol = symbol,
                             timeframe = interval,
-                            candleTime = candle.time,
-                            high = candle.high,
-                            low = candle.low
+                            direction = signal,
+                            signalTime = System.currentTimeMillis(),
+                            signalCandleTime = newestClosed.time,
+                            entryPrice = entry,
+                            stopLoss = sl,
+                            takeProfit1 = tp1,
+                            takeProfit2 = tp2,
+                            takeProfit3 = tp3,
+                            score = analysis.score
                         )
+
+                        // Simpan sinyal terakhir meskipun entry diblokir.
+                        // Ini mencegah percobaan berulang untuk arah yang sama.
+                        lastSignal = signal
+
+                        if (insertedId > 0L) {
+                            updateStatus(
+                                "Jurnal mencatat $symbol $signal • $interval"
+                            )
+
+                            sendSignalNotification(
+                                notificationId = notificationId(insertedId),
+                                symbol = symbol,
+                                signal = signal,
+                                entry = entry,
+                                sl = sl,
+                                tp1 = tp1,
+                                tp2 = tp2,
+                                tp3 = tp3,
+                                score = analysis.score
+                            )
+                        } else {
+                            updateStatus(
+                                "$symbol • $interval memiliki entry OPEN " +
+                                    "atau sinyal tidak dapat disimpan"
+                            )
+                        }
+
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        Log.e(TAG, "Gagal memproses candle jurnal", e)
+                        Log.e(TAG, "Gagal memproses market", e)
+                        updateStatus("Terjadi kesalahan pemrosesan market")
                     }
-                }
-            }
-
-            val newestClosed = closedCandles.last()
-
-            if (newestClosed.time <= lastClosedTime) {
-                return@LiveMarketRepository
-            }
-
-            val analysis =
-                AnalysisEngine.analyze(closedCandles)
-                    ?: run {
-                        lastClosedTime = newestClosed.time
-                        return@LiveMarketRepository
-                    }
-
-            lastClosedTime = newestClosed.time
-
-            val signal = analysis.signal.uppercase(Locale.US)
-
-            if (signal != "BUY" && signal != "SELL") {
-                lastSignal = signal
-                return@LiveMarketRepository
-            }
-
-            if (signal == lastSignal) {
-                return@LiveMarketRepository
-            }
-
-            val entry = analysis.entryPrice ?: analysis.lastPrice
-            val sl = analysis.stopLoss
-            val tp1 = analysis.takeProfit1
-            val tp2 = analysis.takeProfit2
-            val tp3 = analysis.takeProfit3
-
-            if (
-                !entry.isFinite() || entry <= 0.0 ||
-                sl == null || !sl.isFinite() ||
-                tp1 == null || !tp1.isFinite() ||
-                tp2 == null || !tp2.isFinite()
-            ) {
-                lastSignal = signal
-                updateStatus("Level sinyal $signal tidak valid")
-                return@LiveMarketRepository
-            }
-
-            // Penyimpanan memeriksa entry OPEN secara transaksional.
-            // Notifikasi hanya dikirim jika entry baru berhasil disimpan.
-            serviceScope.launch {
-                try {
-                    val insertedId = journal.recordSignal(
-                        symbol = symbol,
-                        timeframe = interval,
-                        direction = signal,
-                        signalTime = System.currentTimeMillis(),
-                        signalCandleTime = newestClosed.time,
-                        entryPrice = entry,
-                        stopLoss = sl,
-                        takeProfit1 = tp1,
-                        takeProfit2 = tp2,
-                        takeProfit3 = tp3,
-                        score = analysis.score
-                    )
-
-                    if (insertedId > 0L) {
-                        lastSignal = signal
-
-                        updateStatus(
-                            "Jurnal mencatat $symbol $signal • $interval"
-                        )
-
-                        sendSignalNotification(
-                            symbol = symbol,
-                            signal = signal,
-                            entry = entry,
-                            sl = sl,
-                            tp1 = tp1,
-                            tp2 = tp2,
-                            tp3 = tp3,
-                            score = analysis.score
-                        )
-                    } else {
-                        updateStatus(
-                            "$symbol • $interval masih memiliki entry OPEN; " +
-                                "entry baru diblokir"
-                        )
-                    }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.e(TAG, "Gagal mencatat sinyal jurnal", e)
-                    updateStatus("Gagal menyimpan sinyal ke jurnal")
                 }
             }
         }
@@ -219,7 +221,14 @@ class BackgroundSignalService : Service() {
         return START_STICKY
     }
 
+    private fun notificationId(entryId: Long): Int {
+        return (entryId % Int.MAX_VALUE)
+            .toInt()
+            .coerceAtLeast(1)
+    }
+
     private fun sendSignalNotification(
+        notificationId: Int,
         symbol: String,
         signal: String,
         entry: Double,
@@ -269,7 +278,7 @@ class BackgroundSignalService : Service() {
 
         try {
             NotificationManagerCompat.from(this).notify(
-                SIGNAL_ID,
+                notificationId,
                 notification
             )
         } catch (_: SecurityException) {
@@ -380,6 +389,5 @@ class BackgroundSignalService : Service() {
         const val SIGNAL_CHANNEL = "market_signal_alerts"
 
         const val FOREGROUND_ID = 4101
-        const val SIGNAL_ID = 4102
     }
 }
