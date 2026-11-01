@@ -1,7 +1,6 @@
 package com.example.aimarket
 
 import android.Manifest
-import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
@@ -28,7 +27,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlin.math.max
@@ -102,9 +104,26 @@ private fun LiveAnalyzerApp() {
     val notificationPermissionLauncher =
         rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestPermission()
-        ) { granted ->
-            notificationsEnabled = granted || Build.VERSION.SDK_INT < 33
+        ) {
+            notificationsEnabled = hasNotificationPermission(context)
         }
+
+    DisposableEffect(context, prefs) {
+        val activity = context as? ComponentActivity
+
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                backgroundEnabled = prefs.getBoolean("enabled", false)
+                notificationsEnabled = hasNotificationPermission(context)
+            }
+        }
+
+        activity?.lifecycle?.addObserver(observer)
+
+        onDispose {
+            activity?.lifecycle?.removeObserver(observer)
+        }
+    }
 
     LaunchedEffect(symbol, interval) {
         prefs.edit()
@@ -164,6 +183,10 @@ private fun LiveAnalyzerApp() {
     }
 
     val lastPrice = candles.lastOrNull()?.close
+
+    val openJournalCount = journalEntries.count {
+        it.status == TradingJournal.STATUS_OPEN
+    }
 
     MaterialTheme(
         colorScheme = darkColorScheme(
@@ -492,8 +515,7 @@ private fun LiveAnalyzerApp() {
 
                         JournalStat(
                             "OPEN",
-                            (totalJournalCount - closedJournalCount)
-                                .coerceAtLeast(0).toString(),
+                            openJournalCount.toString(),
                             Amber,
                             Modifier.weight(1f)
                         )
@@ -651,7 +673,11 @@ private fun LiveAnalyzerApp() {
                 }
 
                 Text(
-                    "Pemantauan memakai layanan Android yang berjalan dengan notifikasi permanen. Pilihan pair/timeframe disimpan saat dipilih.",
+                    if (backgroundEnabled) {
+                        "Pemantauan telah diminta aktif. Status ini mengikuti preferensi aplikasi dan bukan pemeriksaan langsung proses Android."
+                    } else {
+                        "Pemantauan latar belakang tidak diaktifkan. Pilihan pair/timeframe tetap disimpan saat dipilih."
+                    },
                     color = Muted,
                     fontSize = 11.sp,
                     lineHeight = 16.sp
@@ -667,7 +693,7 @@ private fun LiveAnalyzerApp() {
                                 Manifest.permission.POST_NOTIFICATIONS
                             )
                         } else {
-                            notificationsEnabled = true
+                            notificationsEnabled = hasNotificationPermission(context)
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
@@ -687,9 +713,9 @@ private fun LiveAnalyzerApp() {
 
                 Text(
                     if (notificationsEnabled) {
-                        "Notifikasi entry baru dikelola oleh layanan pemantauan latar belakang agar tidak terjadi notifikasi ganda."
+                        "Izin notifikasi tersedia. Notifikasi entry baru dikelola oleh layanan pemantauan latar belakang agar tidak terjadi notifikasi ganda."
                     } else {
-                        "Aktifkan izin notifikasi agar HP dapat memberi peringatan saat layanan pemantauan menemukan entry baru."
+                        "Aktifkan izin notifikasi dan pastikan notifikasi aplikasi tidak diblokir di pengaturan Android."
                     },
                     color = Muted,
                     fontSize = 11.sp,
@@ -999,9 +1025,13 @@ private fun createSignalNotificationChannel(context: Context) {
 }
 
 private fun hasNotificationPermission(context: Context): Boolean {
-    return Build.VERSION.SDK_INT < 33 ||
-        ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.POST_NOTIFICATIONS
-        ) == PackageManager.PERMISSION_GRANTED
+    val runtimePermissionGranted =
+        Build.VERSION.SDK_INT < 33 ||
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+
+    return runtimePermissionGranted &&
+        NotificationManagerCompat.from(context).areNotificationsEnabled()
 }
