@@ -9,13 +9,25 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.util.Locale
 
 class BackgroundSignalService : Service() {
 
     private var repository: LiveMarketRepository? = null
+
+    private val serviceScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private lateinit var journal: TradingJournalRepository
 
     private var lastClosedTime = 0L
     private var lastSignal: String? = null
@@ -23,18 +35,10 @@ class BackgroundSignalService : Service() {
     private var activeSymbol = "BTCUSDT"
     private var activeInterval = "1m"
 
-    // Posisi virtual untuk mencegah sinyal searah berulang.
-    private var tradeDirection: String? = null
-    private var tradeEntry = 0.0
-    private var tradeStopLoss = 0.0
-    private var tradeTakeProfit3 = 0.0
-
-    // Setelah SL/TP3 tercapai, sinyal searah harus netral
-    // atau berbalik arah dahulu sebelum boleh muncul lagi.
-    private var waitingForReset = false
-
     override fun onCreate() {
         super.onCreate()
+
+        journal = TradingJournalRepository(applicationContext)
         createChannels()
 
         startForeground(
@@ -53,7 +57,8 @@ class BackgroundSignalService : Service() {
             return START_NOT_STICKY
         }
 
-        val prefs = getSharedPreferences("market_monitor", MODE_PRIVATE)
+        val prefs =
+            getSharedPreferences("market_monitor", MODE_PRIVATE)
 
         activeSymbol = intent?.getStringExtra(EXTRA_SYMBOL)
             ?: prefs.getString("symbol", "BTCUSDT")
@@ -70,40 +75,62 @@ class BackgroundSignalService : Service() {
             .apply()
 
         repository?.stop()
+        repository = null
 
         lastClosedTime = 0L
         lastSignal = null
-        tradeDirection = null
-        tradeEntry = 0.0
-        tradeStopLoss = 0.0
-        tradeTakeProfit3 = 0.0
-        waitingForReset = false
+
+        val symbol = activeSymbol
+        val interval = activeInterval
 
         repository = LiveMarketRepository { candles, live, message ->
 
-            // Perbarui status service tanpa mengubah notifikasi sinyal.
             updateStatus(
-                if (live) "Memantau $activeSymbol • $activeInterval"
+                if (live) "Memantau $symbol • $interval"
                 else message
             )
 
-            if (candles.isEmpty()) return@LiveMarketRepository
-
-            val latestPrice = candles.lastOrNull()?.close ?: return@LiveMarketRepository
-            if (!latestPrice.isFinite() || latestPrice <= 0.0) {
+            if (candles.isEmpty()) {
                 return@LiveMarketRepository
             }
 
-            // Pantau posisi virtual pada setiap pembaruan harga.
-            checkTradeExit(latestPrice)
+            // Selalu gunakan candle tertutup untuk evaluasi hasil virtual.
+            val closedCandles = candles
+                .filter { it.closed }
+                .sortedBy { it.time }
 
-            // Analisis hanya candle yang sudah ditutup.
-            val closedCandles = candles.filter { it.closed }
-            if (closedCandles.size < 30) return@LiveMarketRepository
+            if (closedCandles.isEmpty()) {
+                return@LiveMarketRepository
+            }
+
+            // Proses seluruh candle yang tersedia.
+            // Repository jurnal mengabaikan candle yang sudah diproses,
+            // candle sebelum entry, serta posisi yang sudah selesai.
+            for (candle in closedCandles) {
+                serviceScope.launch {
+                    try {
+                        journal.processClosedCandle(
+                            symbol = symbol,
+                            timeframe = interval,
+                            candleTime = candle.time,
+                            high = candle.high,
+                            low = candle.low
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.e(
+                            TAG,
+                            "Gagal memproses candle jurnal",
+                            e
+                        )
+                    }
+                }
+            }
 
             val newestClosed = closedCandles.last()
 
-            // Analisis hanya sekali untuk setiap candle tertutup.
+            // Jangan menganalisis candle yang sama lebih dari sekali.
             if (newestClosed.time <= lastClosedTime) {
                 return@LiveMarketRepository
             }
@@ -115,118 +142,97 @@ class BackgroundSignalService : Service() {
                 }
 
             lastClosedTime = newestClosed.time
+
             val signal = analysis.signal.uppercase(Locale.US)
 
-            // Jika posisi sebelumnya sudah berakhir, jangan langsung
-            // membuka sinyal baru searah tanpa reset sinyal.
-            if (waitingForReset) {
-                if (signal == "WAIT" || signal != tradeDirection) {
-                    waitingForReset = false
-                } else {
-                    lastSignal = signal
-                    return@LiveMarketRepository
-                }
-            }
-
-            // Abaikan sinyal selain BUY dan SELL.
             if (signal != "BUY" && signal != "SELL") {
                 lastSignal = signal
                 return@LiveMarketRepository
             }
 
-            // Jangan kirim sinyal sama berulang kali.
-            if (signal == lastSignal || tradeDirection == signal) {
-                lastSignal = signal
+            // Kirim sinyal hanya ketika arah berubah dari sinyal terakhir.
+            if (signal == lastSignal) {
                 return@LiveMarketRepository
             }
 
-            val atr = analysis.atr
-            val entry = analysis.lastPrice
+            val entry = analysis.entryPrice ?: analysis.lastPrice
+            val sl = analysis.stopLoss
+            val tp1 = analysis.takeProfit1
+            val tp2 = analysis.takeProfit2
+            val tp3 = analysis.takeProfit3
 
-            if (atr == null || !atr.isFinite() || atr <= 0.0 ||
-                !entry.isFinite() || entry <= 0.0
+            if (
+                !entry.isFinite() || entry <= 0.0 ||
+                sl == null || !sl.isFinite() ||
+                tp1 == null || !tp1.isFinite() ||
+                tp2 == null || !tp2.isFinite()
             ) {
                 lastSignal = signal
+                updateStatus("Level sinyal $signal tidak valid")
                 return@LiveMarketRepository
             }
 
-            val slDistance = 1.5 * atr
-            val tp3Distance = 3.0 * atr
+            // Catat sinyal di database lokal.
+            // Indeks unik di database mencegah candle yang sama
+            // tercatat dua kali untuk simbol dan timeframe yang sama.
+            serviceScope.launch {
+                try {
+                    val insertedId = journal.recordSignal(
+                        symbol = symbol,
+                        timeframe = interval,
+                        direction = signal,
+                        signalTime = System.currentTimeMillis(),
+                        signalCandleTime = newestClosed.time,
+                        entryPrice = entry,
+                        stopLoss = sl,
+                        takeProfit1 = tp1,
+                        takeProfit2 = tp2,
+                        takeProfit3 = tp3,
+                        score = analysis.score
+                    )
 
-            tradeDirection = signal
-            tradeEntry = entry
-
-            if (signal == "BUY") {
-                tradeStopLoss = entry - slDistance
-                tradeTakeProfit3 = entry + tp3Distance
-            } else {
-                tradeStopLoss = entry + slDistance
-                tradeTakeProfit3 = entry - tp3Distance
+                    if (insertedId > 0L) {
+                        updateStatus(
+                            "Jurnal mencatat $symbol $signal • $interval"
+                        )
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e(TAG, "Gagal mencatat sinyal jurnal", e)
+                    updateStatus("Gagal menyimpan sinyal ke jurnal")
+                }
             }
 
-            waitingForReset = false
             lastSignal = signal
 
             sendSignalNotification(
+                symbol = symbol,
                 signal = signal,
                 entry = entry,
-                atr = atr,
+                sl = sl,
+                tp1 = tp1,
+                tp2 = tp2,
+                tp3 = tp3,
                 score = analysis.score
             )
         }
 
-        repository?.start(activeSymbol, activeInterval)
+        repository?.start(symbol, interval)
 
         return START_STICKY
     }
 
-    private fun checkTradeExit(price: Double) {
-        val direction = tradeDirection ?: return
-
-        val stoppedOut: Boolean
-        val targetReached: Boolean
-
-        if (direction == "BUY") {
-            stoppedOut = price <= tradeStopLoss
-            targetReached = price >= tradeTakeProfit3
-        } else {
-            stoppedOut = price >= tradeStopLoss
-            targetReached = price <= tradeTakeProfit3
-        }
-
-        if (stoppedOut || targetReached) {
-            val outcome = if (targetReached) {
-                "TP3 tercapai"
-            } else {
-                "SL tersentuh"
-            }
-
-            updateStatus("$activeSymbol • $outcome • menunggu reset sinyal")
-
-            tradeDirection = null
-            waitingForReset = true
-        }
-    }
-
     private fun sendSignalNotification(
+        symbol: String,
         signal: String,
         entry: Double,
-        atr: Double,
+        sl: Double,
+        tp1: Double,
+        tp2: Double,
+        tp3: Double?,
         score: Int
     ) {
-        val sl = if (signal == "BUY") {
-            entry - 1.5 * atr
-        } else {
-            entry + 1.5 * atr
-        }
-
-        val sign = if (signal == "BUY") 1.0 else -1.0
-
-        val tp1 = entry + sign * atr
-        val tp2 = entry + sign * 2.0 * atr
-        val tp3 = entry + sign * 3.0 * atr
-
-        // Jumlah desimal disesuaikan dengan besarnya harga.
         val decimals = when {
             entry >= 1000.0 -> 2
             entry >= 1.0 -> 4
@@ -236,27 +242,34 @@ class BackgroundSignalService : Service() {
         fun price(value: Double): String =
             String.format(Locale.US, "%.${decimals}f", value)
 
+        val tp3Text = tp3?.let { price(it) } ?: "Tidak tersedia"
+
         val body =
-            "$activeSymbol $signal • Skor $score\n" +
+            "$symbol $signal • Skor $score\n" +
             "Entry: ${price(entry)}\n" +
             "SL: ${price(sl)}\n" +
             "TP1: ${price(tp1)}\n" +
             "TP2: ${price(tp2)}\n" +
-            "TP3: ${price(tp3)}"
+            "TP3: $tp3Text"
 
         if (!notificationsAllowed()) {
-            updateStatus("Sinyal $signal terdeteksi, tetapi izin notifikasi belum aktif")
+            updateStatus(
+                "Sinyal $signal terdeteksi, tetapi izin notifikasi belum aktif"
+            )
             return
         }
 
-        val notification = NotificationCompat.Builder(this, SIGNAL_CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("Sinyal baru: $signal")
-            .setContentText("$activeSymbol • Entry ${price(entry)}")
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setAutoCancel(true)
-            .build()
+        val notification =
+            NotificationCompat.Builder(this, SIGNAL_CHANNEL)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle("Sinyal baru: $signal")
+                .setContentText("$symbol • Entry ${price(entry)}")
+                .setStyle(
+                    NotificationCompat.BigTextStyle().bigText(body)
+                )
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .build()
 
         try {
             NotificationManagerCompat.from(this).notify(
@@ -277,7 +290,9 @@ class BackgroundSignalService : Service() {
             return false
         }
 
-        return NotificationManagerCompat.from(this).areNotificationsEnabled()
+        return NotificationManagerCompat
+            .from(this)
+            .areNotificationsEnabled()
     }
 
     private fun updateStatus(text: String) {
@@ -287,7 +302,7 @@ class BackgroundSignalService : Service() {
                 statusNotification(text)
             )
         } catch (_: SecurityException) {
-            // Jangan biarkan masalah izin notifikasi menghentikan service.
+            // Masalah izin notifikasi tidak boleh menghentikan service.
         }
     }
 
@@ -303,7 +318,8 @@ class BackgroundSignalService : Service() {
 
     private fun createChannels() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
+            val manager =
+                getSystemService(NotificationManager::class.java)
 
             manager.createNotificationChannel(
                 NotificationChannel(
@@ -345,13 +361,20 @@ class BackgroundSignalService : Service() {
     override fun onDestroy() {
         repository?.stop()
         repository = null
+
+        serviceScope.cancel()
+
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
-        const val ACTION_STOP = "com.example.aimarket.STOP_MONITOR"
+        private const val TAG = "BackgroundSignalService"
+
+        const val ACTION_STOP =
+            "com.example.aimarket.STOP_MONITOR"
+
         const val EXTRA_SYMBOL = "symbol"
         const val EXTRA_INTERVAL = "interval"
 
