@@ -36,11 +36,22 @@ data class TradingJournal(
     // Informasi analisis
     val score: Int,
 
-    // Pemantauan hasil virtual
+    // Status pemantauan hasil virtual
     val status: String = STATUS_OPEN,
     val tp1Hit: Boolean = false,
     val tp2Hit: Boolean = false,
     val tp3Hit: Boolean = false,
+
+    // Pembagian posisi untuk partial take profit
+    val tp1ClosedFraction: Double = DEFAULT_TP1_FRACTION,
+    val tp2ClosedFraction: Double = DEFAULT_TP2_FRACTION,
+    val tp3ClosedFraction: Double = DEFAULT_TP3_FRACTION,
+
+    // Akumulasi hasil dan sisa posisi
+    val realizedR: Double = 0.0,
+    val remainingFraction: Double = 1.0,
+
+    // Hasil akhir transaksi
     val exitPrice: Double? = null,
     val exitTime: Long? = null,
     val resultR: Double? = null,
@@ -59,5 +70,10 @@ data class TradingJournal(
 
         const val DIRECTION_BUY = "BUY"
         const val DIRECTION_SELL = "SELL"
+
+        // Default pembagian posisi: total 100%
+        const val DEFAULT_TP1_FRACTION = 0.50
+        const val DEFAULT_TP2_FRACTION = 0.30
+        const val DEFAULT_TP3_FRACTION = 0.20
     }
 }
