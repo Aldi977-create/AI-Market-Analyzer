@@ -3,6 +3,7 @@ package com.example.aimarket
 import android.content.Context
 import androidx.room.withTransaction
 import kotlinx.coroutines.flow.Flow
+import kotlin.math.abs
 import kotlin.math.max
 
 class TradingJournalRepository(context: Context) {
@@ -40,12 +41,17 @@ class TradingJournalRepository(context: Context) {
         takeProfit3: Double?,
         score: Int
     ): Long {
+
         if (
             direction != TradingJournal.DIRECTION_BUY &&
             direction != TradingJournal.DIRECTION_SELL
         ) return -1L
 
         if (
+            symbol.isBlank() ||
+            timeframe.isBlank() ||
+            signalTime <= 0L ||
+            signalCandleTime <= 0L ||
             !entryPrice.isFinite() ||
             !stopLoss.isFinite() ||
             !takeProfit1.isFinite() ||
@@ -53,7 +59,9 @@ class TradingJournalRepository(context: Context) {
             (takeProfit3 != null && !takeProfit3.isFinite())
         ) return -1L
 
-        if (entryPrice <= 0.0 || stopLoss <= 0.0) return -1L
+        if (entryPrice <= 0.0 || stopLoss <= 0.0) {
+            return -1L
+        }
 
         val validLevels =
             if (direction == TradingJournal.DIRECTION_BUY) {
@@ -71,7 +79,8 @@ class TradingJournalRepository(context: Context) {
         if (!validLevels) return -1L
 
         return database.withTransaction {
-            // Satu entry OPEN saja untuk setiap simbol + timeframe.
+
+            // Satu entry OPEN untuk setiap simbol dan timeframe.
             val hasOpenEntry = dao.getOpenEntries().any {
                 it.symbol == symbol &&
                     it.timeframe == timeframe
@@ -100,9 +109,10 @@ class TradingJournalRepository(context: Context) {
     }
 
     /**
-     * Memproses candle yang sudah tertutup.
-     * Jika SL dan TP tersentuh dalam candle yang sama,
-     * SL diprioritaskan agar hasil backtest konservatif.
+     * Memproses candle tertutup secara berurutan.
+     *
+     * Jika SL dan TP tersentuh pada candle yang sama,
+     * SL diprioritaskan untuk hasil backtest konservatif.
      */
     suspend fun processClosedCandle(
         symbol: String,
@@ -111,9 +121,17 @@ class TradingJournalRepository(context: Context) {
         high: Double,
         low: Double
     ) {
-        if (!high.isFinite() || !low.isFinite() || low > high) return
+        if (
+            symbol.isBlank() ||
+            timeframe.isBlank() ||
+            candleTime <= 0L ||
+            !high.isFinite() ||
+            !low.isFinite() ||
+            low > high
+        ) return
 
         database.withTransaction {
+
             val entries = dao.getOpenEntries().filter {
                 it.symbol == symbol &&
                     it.timeframe == timeframe &&
@@ -123,11 +141,12 @@ class TradingJournalRepository(context: Context) {
 
             for (entry in entries) {
                 val updated = processCandle(
-                    entry,
-                    candleTime,
-                    high,
-                    low
+                    entry = entry,
+                    candleTime = candleTime,
+                    high = high,
+                    low = low
                 )
+
                 dao.update(updated)
             }
         }
@@ -139,6 +158,7 @@ class TradingJournalRepository(context: Context) {
         high: Double,
         low: Double
     ): TradingJournal {
+
         val isBuy =
             entry.direction == TradingJournal.DIRECTION_BUY
 
@@ -168,17 +188,17 @@ class TradingJournalRepository(context: Context) {
         val tp2Reached = entry.tp2Hit || tp2HitNow
         val tp3Reached = entry.tp3Hit || tp3HitNow
 
+        // SL diprioritaskan jika tersentuh bersamaan dengan TP.
         if (stopHit) {
             return entry.copy(
                 status = TradingJournal.STATUS_SL,
-                tp1Hit = entry.tp1Hit,
-                tp2Hit = entry.tp2Hit,
-                tp3Hit = entry.tp3Hit,
                 exitPrice = entry.stopLoss,
                 exitTime = candleTime,
                 resultR = -1.0,
                 lastProcessedCandleTime = candleTime,
-                note = if (tp1HitNow || tp2HitNow || tp3HitNow) {
+                note = if (
+                    tp1HitNow || tp2HitNow || tp3HitNow
+                ) {
                     "SL and target touched in same candle; SL prioritized"
                 } else {
                     entry.note
@@ -186,31 +206,38 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
+        // Jika TP3 tersedia, TP3 menjadi target akhir.
         if (entry.takeProfit3 != null && tp3HitNow) {
+            val target = entry.takeProfit3
+
             return entry.copy(
                 status = TradingJournal.STATUS_TP3,
                 tp1Hit = true,
                 tp2Hit = true,
                 tp3Hit = true,
-                exitPrice = entry.takeProfit3,
+                exitPrice = target,
                 exitTime = candleTime,
-                resultR = calculateR(entry, entry.takeProfit3),
+                resultR = calculateR(entry, target),
                 lastProcessedCandleTime = candleTime
             )
         }
 
+        // Jika TP3 tidak tersedia, TP2 menjadi target akhir.
         if (entry.takeProfit3 == null && tp2HitNow) {
+            val target = entry.takeProfit2
+
             return entry.copy(
                 status = TradingJournal.STATUS_TP2_FINAL,
                 tp1Hit = true,
                 tp2Hit = true,
-                exitPrice = entry.takeProfit2,
+                exitPrice = target,
                 exitTime = candleTime,
-                resultR = calculateR(entry, entry.takeProfit2),
+                resultR = calculateR(entry, target),
                 lastProcessedCandleTime = candleTime
             )
         }
 
+        // Entry masih berjalan: simpan perkembangan target.
         return entry.copy(
             tp1Hit = tp1Reached,
             tp2Hit = tp2Reached,
@@ -223,8 +250,9 @@ class TradingJournalRepository(context: Context) {
         entry: TradingJournal,
         exitPrice: Double
     ): Double {
+
         val risk = max(
-            kotlin.math.abs(entry.entryPrice - entry.stopLoss),
+            abs(entry.entryPrice - entry.stopLoss),
             1e-12
         )
 
