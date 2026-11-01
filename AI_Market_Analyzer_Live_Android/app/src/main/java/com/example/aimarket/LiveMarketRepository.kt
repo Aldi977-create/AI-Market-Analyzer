@@ -1,581 +1,782 @@
 package com.example.aimarket
 
-import android.os.Handler
-import android.os.Looper
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import org.json.JSONArray
-import org.json.JSONObject
-import java.time.Instant
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
+import android.Manifest
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import kotlin.math.max
+import kotlin.math.min
 
-class LiveMarketRepository(
-    private val onUpdate: (List<Candle>, Boolean, String) -> Unit
-) {
-    private val client = OkHttpClient.Builder()
-        .pingInterval(20, TimeUnit.SECONDS)
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
-        .build()
+private val Bg = Color(0xFF080D18)
+private val Panel = Color(0xFF111A2A)
+private val Muted = Color(0xFF9AA8BD)
+private val Green = Color(0xFF36D399)
+private val Red = Color(0xFFFF657A)
+private val Amber = Color(0xFFFFC857)
 
-    private val main = Handler(Looper.getMainLooper())
+private const val SIGNAL_CHANNEL_ID = "market_signal_alerts"
+private const val PREFS_NAME = "market_monitor"
+private const val PREF_SYMBOL = "symbol"
+private const val PREF_INTERVAL = "interval"
 
-    private var socket: okhttp3.WebSocket? = null
-    private var currentSymbol = "BTCUSDT"
-    private var currentInterval = "1m"
-
-    private val candles = mutableListOf<Candle>()
-
-    @Volatile
-    private var stopped = true
-
-    private val generation = AtomicInteger(0)
-
-    fun start(symbol: String, interval: String) {
-        stop()
-
-        val myGeneration = generation.incrementAndGet()
-
-        stopped = false
-        currentSymbol = symbol.uppercase()
-        currentInterval = interval
-
-        synchronized(candles) {
-            candles.clear()
-        }
-
-        when (currentSymbol) {
-            "XAUUSD" -> {
-                publish(false, "Menghubungkan ke feed XAUUSD…")
-                startGoldFeed(myGeneration)
-            }
-
-            "BTCUSD" -> {
-                publish(false, "Menghubungkan ke Bitstamp BTC/USD…")
-                startBitstampFeed(myGeneration)
-            }
-
-            else -> {
-                publish(false, "Memuat candle historis Binance…")
-                startBinanceFeed(myGeneration)
-            }
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        createSignalNotificationChannel(this)
+        setContent {
+            LiveAnalyzerApp()
         }
     }
+}
 
-    // ---------------------------------------------------------
-    // BINANCE: BTCUSDT, ETHUSDT, BNBUSDT, SOLUSDT, XRPUSDT
-    // ---------------------------------------------------------
+@Composable
+private fun LiveAnalyzerApp() {
+    val context = LocalContext.current
 
-    private fun startBinanceFeed(myGeneration: Int) {
-        Thread {
-            try {
-                val url =
-                    "https://api.binance.com/api/v3/klines" +
-                    "?symbol=$currentSymbol" +
-                    "&interval=$currentInterval&limit=120"
-
-                val request = Request.Builder()
-                    .url(url)
-                    .get()
-                    .build()
-
-                client.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        throw IllegalStateException("HTTP ${response.code}")
-                    }
-
-                    val arr = JSONArray(response.body?.string() ?: "[]")
-                    val parsed = mutableListOf<Candle>()
-
-                    for (i in 0 until arr.length()) {
-                        val k = arr.getJSONArray(i)
-
-                        parsed.add(
-                            Candle(
-                                time = k.getLong(0),
-                                open = k.getString(1).toDouble(),
-                                high = k.getString(2).toDouble(),
-                                low = k.getString(3).toDouble(),
-                                close = k.getString(4).toDouble(),
-                                volume = k.getString(5).toDouble(),
-                                closed = k.getLong(6) < System.currentTimeMillis()
-                            )
-                        )
-                    }
-
-                    if (!isCurrent(myGeneration)) return@Thread
-
-                    synchronized(candles) {
-                        candles.clear()
-                        candles.addAll(parsed)
-                    }
-                }
-
-                if (!isCurrent(myGeneration)) return@Thread
-
-                publish(true, "LIVE • Binance")
-                connectSocket(myGeneration)
-
-            } catch (e: Exception) {
-                if (isCurrent(myGeneration)) {
-                    publish(
-                        false,
-                        "Binance gagal: ${e.message ?: "periksa internet"}"
-                    )
-                }
-            }
-        }.start()
+    val prefs = remember {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
 
-    private fun connectSocket(myGeneration: Int) {
-        if (!isCurrent(myGeneration)) return
+    var notificationsEnabled by remember {
+        mutableStateOf(hasNotificationPermission(context))
+    }
 
-        val stream =
-            currentSymbol.lowercase() + "@kline_" + currentInterval
+    var backgroundEnabled by remember {
+        mutableStateOf(prefs.getBoolean("enabled", false))
+    }
 
-        val request = Request.Builder()
-            .url("wss://stream.binance.com:9443/ws/$stream")
-            .build()
-
-        socket = client.newWebSocket(
-            request,
-            object : okhttp3.WebSocketListener() {
-
-                override fun onOpen(
-                    webSocket: okhttp3.WebSocket,
-                    response: okhttp3.Response
-                ) {
-                    if (isCurrent(myGeneration)) {
-                        publish(true, "LIVE • Binance WebSocket")
-                    }
-                }
-
-                override fun onMessage(
-                    webSocket: okhttp3.WebSocket,
-                    text: String
-                ) {
-                    if (!isCurrent(myGeneration)) return
-
-                    try {
-                        val root = JSONObject(text)
-                        val k = root.getJSONObject("k")
-
-                        val candle = Candle(
-                            time = k.getLong("t"),
-                            open = k.getString("o").toDouble(),
-                            high = k.getString("h").toDouble(),
-                            low = k.getString("l").toDouble(),
-                            close = k.getString("c").toDouble(),
-                            volume = k.getString("v").toDouble(),
-                            closed = k.getBoolean("x")
-                        )
-
-                        synchronized(candles) {
-                            val index =
-                                candles.indexOfLast { it.time == candle.time }
-
-                            if (index >= 0) {
-                                candles[index] = candle
-                            } else {
-                                candles.add(candle)
-                            }
-
-                            candles.sortBy { it.time }
-
-                            while (candles.size > 300) {
-                                candles.removeAt(0)
-                            }
-                        }
-
-                        publish(
-                            true,
-                            if (candle.closed) {
-                                "LIVE • Binance • candle ditutup"
-                            } else {
-                                "LIVE • Binance • candle berjalan"
-                            }
-                        )
-                    } catch (_: Exception) {
-                        publish(false, "Data Binance tidak dapat dibaca")
-                    }
-                }
-
-                override fun onFailure(
-                    webSocket: okhttp3.WebSocket,
-                    t: Throwable,
-                    response: okhttp3.Response?
-                ) {
-                    if (!isCurrent(myGeneration)) return
-
-                    publish(
-                        false,
-                        "Koneksi Binance terputus: " +
-                            (t.message ?: "mencoba kembali")
-                    )
-
-                    main.postDelayed({
-                        if (isCurrent(myGeneration)) {
-                            connectSocket(myGeneration)
-                        }
-                    }, 3000)
-                }
-
-                override fun onClosed(
-                    webSocket: okhttp3.WebSocket,
-                    code: Int,
-                    reason: String
-                ) {
-                    if (!isCurrent(myGeneration)) return
-
-                    publish(false, "Koneksi Binance ditutup")
-
-                    main.postDelayed({
-                        if (isCurrent(myGeneration)) {
-                            connectSocket(myGeneration)
-                        }
-                    }, 2000)
-                }
-            }
+    var symbol by remember {
+        mutableStateOf(
+            prefs.getString(PREF_SYMBOL, "BTCUSD") ?: "BTCUSD"
         )
     }
 
-    // ---------------------------------------------------------
-    // BITSTAMP: BTCUSD
-    // Uses public REST ticker + OHLC polling.
-    // ---------------------------------------------------------
-
-    private fun startBitstampFeed(myGeneration: Int) {
-        Thread {
-            while (isCurrent(myGeneration)) {
-                try {
-                    val step = intervalToSeconds(currentInterval)
-
-                    val ohlcUrl =
-                        "https://www.bitstamp.net/api/v2/ohlc/btcusd/" +
-                        "?step=$step&limit=120"
-
-                    val ohlcRoot = getJson(ohlcUrl)
-
-                    val data = ohlcRoot.optJSONObject("data")
-                        ?: throw IllegalStateException(
-                            "Respons OHLC Bitstamp tidak valid"
-                        )
-
-                    val bars = data.optJSONArray("ohlc")
-                        ?: throw IllegalStateException(
-                            "Candle BTCUSD tidak tersedia"
-                        )
-
-                    val ticker = getJson(
-                        "https://www.bitstamp.net/api/v2/ticker/btcusd/"
-                    )
-
-                    val lastPrice = ticker.optString("last")
-                        .toDoubleOrNull()
-                        ?: throw IllegalStateException(
-                            "Harga ticker BTCUSD tidak valid"
-                        )
-
-                    if (!lastPrice.isFinite() || lastPrice <= 0.0) {
-                        throw IllegalStateException("Harga BTCUSD tidak valid")
-                    }
-
-                    val now = System.currentTimeMillis()
-                    val stepMs = step * 1000L
-                    val parsed = mutableListOf<Candle>()
-
-                    for (i in 0 until bars.length()) {
-                        val bar = bars.optJSONObject(i) ?: continue
-
-                        val timestampSeconds =
-                            bar.optString("timestamp").toLongOrNull()
-                                ?: continue
-
-                        val time = timestampSeconds * 1000L
-
-                        val open = bar.optString("open").toDoubleOrNull()
-                            ?: continue
-                        val high = bar.optString("high").toDoubleOrNull()
-                            ?: continue
-                        val low = bar.optString("low").toDoubleOrNull()
-                            ?: continue
-                        val close = bar.optString("close").toDoubleOrNull()
-                            ?: continue
-                        val volume = bar.optString("volume")
-                            .toDoubleOrNull() ?: 0.0
-
-                        if (
-                            !open.isFinite() ||
-                            !high.isFinite() ||
-                            !low.isFinite() ||
-                            !close.isFinite() ||
-                            open <= 0.0 ||
-                            high <= 0.0 ||
-                            low <= 0.0 ||
-                            close <= 0.0
-                        ) {
-                            continue
-                        }
-
-                        val isClosed = time + stepMs <= now
-
-                        parsed.add(
-                            Candle(
-                                time = time,
-                                open = open,
-                                high = high,
-                                low = low,
-                                close = close,
-                                volume = volume,
-                                closed = isClosed
-                            )
-                        )
-                    }
-
-                    if (parsed.isEmpty()) {
-                        throw IllegalStateException(
-                            "Bitstamp belum mengirim candle BTCUSD"
-                        )
-                    }
-
-                    // Sinkronkan candle yang sedang berjalan dengan
-                    // ticker terbaru. Jangan mengubah candle yang sudah tutup.
-                    val currentBucket = (now / stepMs) * stepMs
-                    val currentIndex =
-                        parsed.indexOfLast { it.time == currentBucket }
-
-                    if (currentIndex >= 0) {
-                        val old = parsed[currentIndex]
-
-                        parsed[currentIndex] = Candle(
-                            time = old.time,
-                            open = old.open,
-                            high = maxOf(old.high, lastPrice),
-                            low = minOf(old.low, lastPrice),
-                            close = lastPrice,
-                            volume = old.volume,
-                            closed = false
-                        )
-                    }
-
-                    if (!isCurrent(myGeneration)) return@Thread
-
-                    synchronized(candles) {
-                        candles.clear()
-                        candles.addAll(parsed.sortedBy { it.time }.takeLast(300))
-                    }
-
-                    publish(true, "LIVE • BTC/USD • Bitstamp REST")
-
-                } catch (e: Exception) {
-                    if (!isCurrent(myGeneration)) return@Thread
-
-                    synchronized(candles) {
-                        candles.clear()
-                    }
-
-                    publish(
-                        false,
-                        "BTCUSD Bitstamp tidak tersedia: " +
-                            (e.message ?: "periksa koneksi")
-                    )
-                }
-
-                try {
-                    Thread.sleep(15_000)
-                } catch (_: InterruptedException) {
-                    return@Thread
-                }
-            }
-        }.start()
+    var interval by remember {
+        mutableStateOf(
+            prefs.getString(PREF_INTERVAL, "1m") ?: "1m"
+        )
     }
 
-    private fun intervalToSeconds(interval: String): Int {
-        return when (interval) {
-            "1m" -> 60
-            "5m" -> 300
-            "15m" -> 900
-            "1h" -> 3600
-            else -> 60
+    var candles by remember {
+        mutableStateOf<List<Candle>>(emptyList())
+    }
+
+    var connected by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("Menghubungkan…") }
+    var refreshKey by remember { mutableIntStateOf(0) }
+    var observedContext by remember { mutableStateOf("") }
+    var observedSignal by remember { mutableStateOf<String?>(null) }
+    var observedClosedCandleTime by remember { mutableLongStateOf(0L) }
+
+    val notificationPermissionLauncher =
+        rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            notificationsEnabled =
+                granted || Build.VERSION.SDK_INT < 33
+        }
+
+    LaunchedEffect(symbol, interval) {
+        prefs.edit()
+            .putString(PREF_SYMBOL, symbol)
+            .putString(PREF_INTERVAL, interval)
+            .apply()
+    }
+
+    DisposableEffect(symbol, interval, refreshKey) {
+        val repo = LiveMarketRepository { data, live, message ->
+            candles = data
+            connected = live
+            status = message
+        }
+
+        repo.start(symbol, interval)
+
+        onDispose {
+            repo.stop()
         }
     }
 
-    // ---------------------------------------------------------
-    // XAUUSD: Biquote feed
-    // ---------------------------------------------------------
+    val result = remember(candles) {
+        AnalysisEngine.analyze(candles)
+    }
 
-    private fun startGoldFeed(myGeneration: Int) {
-        Thread {
-            while (isCurrent(myGeneration)) {
-                try {
-                    val tick = getJson(
-                        "https://biquote.io/api/XAUUSD?allowStale=false"
+    val lastPrice = candles.lastOrNull()?.close
+
+    LaunchedEffect(symbol, interval, candles, result) {
+        val closedCandle = candles.lastOrNull { it.closed }
+        val signal = result?.signal
+
+        if (closedCandle == null || signal == null) {
+            return@LaunchedEffect
+        }
+
+        val currentContext = "$symbol|$interval"
+
+        if (observedContext != currentContext ||
+            observedClosedCandleTime == 0L
+        ) {
+            observedContext = currentContext
+            observedClosedCandleTime = closedCandle.time
+            observedSignal = signal
+            return@LaunchedEffect
+        }
+
+        if (closedCandle.time > observedClosedCandleTime) {
+            val isNewActionSignal =
+                signal in listOf("BUY", "SELL") &&
+                    signal != observedSignal
+
+            if (isNewActionSignal &&
+                hasNotificationPermission(context)
+            ) {
+                showSignalNotification(
+                    context,
+                    symbol,
+                    interval,
+                    signal,
+                    result.score,
+                    result.lastPrice
+                )
+            }
+
+            observedClosedCandleTime = closedCandle.time
+            observedSignal = signal
+        }
+    }
+
+    MaterialTheme(
+        colorScheme = darkColorScheme(
+            background = Bg,
+            surface = Panel,
+            primary = Green,
+            onBackground = Color.White,
+            onSurface = Color.White
+        )
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Bg
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(
+                            "MARKET LAB",
+                            color = Green,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 2.sp
+                        )
+
+                        Text(
+                            "AI Market Analyzer",
+                            fontSize = 23.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Surface(
+                        color = if (connected) Color(0xFF17382F)
+                        else Color(0xFF49351A),
+                        shape = RoundedCornerShape(50)
+                    ) {
+                        Text(
+                            if (connected) "● LIVE" else "● OFFLINE",
+                            modifier = Modifier.padding(
+                                horizontal = 11.dp,
+                                vertical = 7.dp
+                            ),
+                            color = if (connected) Green else Amber,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                PanelCard {
+                    Text(
+                        when (symbol) {
+                            "BTCUSD" -> "BTC / USD • BITSTAMP FEED"
+                            "XAUUSD" -> "GOLD / XAUUSD • BIQUOTE FEED"
+                            else -> "CRYPTO • DATA PUBLIK BINANCE"
+                        },
+                        color = Muted,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
                     )
 
-                    val marketState =
-                        tick.optString("marketState", "unknown").lowercase()
-
-                    val stale = tick.optBoolean("stale", true)
-                    val age = tick.optLong("quoteAgeSeconds", Long.MAX_VALUE)
-
-                    if (marketState != "open" || stale || age > 300L) {
-                        synchronized(candles) {
-                            candles.clear()
+                    Row(
+                        modifier = Modifier.horizontalScroll(
+                            rememberScrollState()
+                        ),
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        listOf(
+                            "BTCUSD",
+                            "BTCUSDT",
+                            "ETHUSDT",
+                            "BNBUSDT",
+                            "SOLUSDT",
+                            "XRPUSDT",
+                            "XAUUSD"
+                        ).forEach { pair ->
+                            Chip(pair, symbol == pair) {
+                                symbol = pair
+                            }
                         }
+                    }
 
-                        publish(
-                            false,
-                            "MARKET TUTUP / DATA KEDALUWARSA • " +
-                                "chart dan sinyal disembunyikan"
+                    Text(
+                        "Timeframe candle",
+                        color = Muted,
+                        fontSize = 12.sp
+                    )
+
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(7.dp)
+                    ) {
+                        listOf("1m", "5m", "15m", "1h").forEach { timeframe ->
+                            Chip(timeframe, interval == timeframe) {
+                                interval = timeframe
+                            }
+                        }
+                    }
+                }
+
+                PanelCard {
+                    Text(
+                        symbol,
+                        color = Muted,
+                        fontSize = 13.sp
+                    )
+
+                    Text(
+                        lastPrice?.let(::price)
+                            ?: "Menunggu data…",
+                        fontSize = 29.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    Text(
+                        status,
+                        color = if (connected) Green else Amber,
+                        fontSize = 11.sp
+                    )
+
+                    Spacer(Modifier.height(4.dp))
+
+                    if (symbol == "XAUUSD" && !connected) {
+                        Text(
+                            "Chart dan sinyal XAUUSD disembunyikan karena pasar tutup, data kedaluwarsa, atau feed belum tersedia. Coba refresh saat pasar aktif.",
+                            color = Amber,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp
                         )
                     } else {
-                        val candleJson = getJson(
-                            "https://biquote.io/api/XAUUSD/ohlc" +
-                                "?interval=$currentInterval&limit=120"
+                        CandleChart(
+                            Modifier
+                                .fillMaxWidth()
+                                .height(145.dp),
+                            candles.takeLast(70)
                         )
 
-                        val bars =
-                            candleJson.optJSONArray("bars") ?: JSONArray()
+                        Text(
+                            when (symbol) {
+                                "BTCUSD" ->
+                                    "Harga BTC/USD • sumber Bitstamp • candle tertutup untuk analisis"
+                                "XAUUSD" ->
+                                    "Harga emas • sumber Biquote • candle tertutup untuk analisis"
+                                else ->
+                                    "Harga crypto • sumber Binance • candle tertutup untuk analisis"
+                            },
+                            color = Muted,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
 
-                        val parsed = mutableListOf<Candle>()
+                PanelCard {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "AUTO SIGNAL",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 16.sp
+                        )
 
-                        for (i in 0 until bars.length()) {
-                            val bar = bars.optJSONObject(i) ?: continue
-
-                            val openTime = bar.optString("openTime")
-
-                            val time = try {
-                                Instant.parse(openTime).toEpochMilli()
-                            } catch (_: Exception) {
-                                continue
+                        val shownSignal =
+                            if (symbol == "XAUUSD" && !connected) {
+                                "MARKET CLOSED"
+                            } else {
+                                result?.signal ?: "ANALYZING"
                             }
 
-                            val open =
-                                bar.optDouble("open", Double.NaN)
-                            val high =
-                                bar.optDouble("high", Double.NaN)
-                            val low =
-                                bar.optDouble("low", Double.NaN)
-                            val close =
-                                bar.optDouble("close", Double.NaN)
+                        Surface(
+                            color = when (shownSignal) {
+                                "BUY" -> Color(0xFF17382F)
+                                "SELL" -> Color(0xFF48212A)
+                                else -> Color(0xFF49351A)
+                            },
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text(
+                                shownSignal,
+                                modifier = Modifier.padding(
+                                    horizontal = 12.dp,
+                                    vertical = 8.dp
+                                ),
+                                color = when (shownSignal) {
+                                    "BUY" -> Green
+                                    "SELL" -> Red
+                                    else -> Amber
+                                },
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+                    }
 
-                            if (
-                                !open.isFinite() ||
-                                !high.isFinite() ||
-                                !low.isFinite() ||
-                                !close.isFinite()
-                            ) {
-                                continue
-                            }
+                    Text(
+                        if (result == null) {
+                            "Mengumpulkan minimal 52 candle tertutup untuk analisis."
+                        } else {
+                            "Skor aturan teknikal: ${result.score}/100"
+                        },
+                        color = Muted,
+                        fontSize = 12.sp
+                    )
 
-                            parsed.add(
-                                Candle(
-                                    time = time,
-                                    open = open,
-                                    high = high,
-                                    low = low,
-                                    close = close,
-                                    volume = bar.optDouble(
-                                        "tickVolume",
-                                        bar.optDouble("volume", 0.0)
-                                    ),
-                                    closed = !bar.optBoolean("isOpen", false)
-                                )
+                    if (symbol == "XAUUSD" && !connected) {
+                        Text(
+                            "Tidak ada sinyal baru saat pasar tutup atau data XAUUSD tidak valid.",
+                            color = Muted,
+                            fontSize = 12.sp
+                        )
+                    } else if (result != null) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Metric(
+                                "RSI 14",
+                                result.rsi?.let { "%.1f".format(it) } ?: "—"
+                            )
+                            Metric("EMA 9", result.ema9?.let(::price) ?: "—")
+                            Metric("EMA 21", result.ema21?.let(::price) ?: "—")
+                            Metric("EMA 50", result.ema50?.let(::price) ?: "—")
+                        }
+
+                        HorizontalDivider(color = Color(0xFF283448))
+
+                        Text(
+                            "Alasan sinyal",
+                            fontWeight = FontWeight.Bold
+                        )
+
+                        result.reasons.forEach { reason ->
+                            Text(
+                                "• $reason",
+                                color = Muted,
+                                fontSize = 12.sp,
+                                lineHeight = 17.sp
                             )
                         }
 
-                        if (!isCurrent(myGeneration)) return@Thread
+                        val waiting = result.signal == "WAIT"
 
-                        val sorted = parsed.sortedBy { it.time }
+                        Text(
+                            "LEVEL ENTRY & TARGET",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
 
-                        if (sorted.isEmpty()) {
-                            synchronized(candles) {
-                                candles.clear()
-                            }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Metric(
+                                "Entry",
+                                if (waiting) "WAIT"
+                                else result.entryPrice?.let(::price) ?: "—"
+                            )
+                            Metric(
+                                "Stop Loss",
+                                if (waiting) "WAIT"
+                                else result.stopLoss?.let(::price) ?: "—"
+                            )
+                        }
 
-                            publish(
-                                false,
-                                "Feed XAUUSD aktif, candle belum tersedia"
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Metric(
+                                "TP 1",
+                                if (waiting) "WAIT"
+                                else result.takeProfit1?.let(::price) ?: "—"
+                            )
+                            Metric(
+                                "TP 2",
+                                if (waiting) "WAIT"
+                                else result.takeProfit2?.let(::price) ?: "—"
+                            )
+                            Metric(
+                                "TP 3",
+                                if (waiting) "WAIT"
+                                else result.takeProfit3?.let(::price) ?: "—"
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Metric(
+                                "ATR 14",
+                                result.atr?.let(::price) ?: "—"
+                            )
+                        }
+
+                        Text(
+                            if (waiting) {
+                                "WAIT berarti belum ada konfirmasi yang cukup. Level entry, SL, dan TP belum diberikan."
+                            } else {
+                                "*Level estimasi berbasis ATR dan volatilitas timeframe; bukan instruksi order. Harga eksekusi dapat berbeda. Periksa spread, biaya, dan risiko."
+                            },
+                            color = Amber,
+                            fontSize = 10.sp
+                        )
+                    }
+                }
+
+                Button(
+                    onClick = { refreshKey++ },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF17382F)
+                    )
+                ) {
+                    Text("Reconnect / Refresh data", color = Green)
+                }
+
+                Button(
+                    onClick = {
+                        if (Build.VERSION.SDK_INT >= 33 &&
+                            !hasNotificationPermission(context)
+                        ) {
+                            notificationPermissionLauncher.launch(
+                                Manifest.permission.POST_NOTIFICATIONS
                             )
                         } else {
-                            synchronized(candles) {
-                                candles.clear()
-                                candles.addAll(sorted.takeLast(300))
+                            val intent = android.content.Intent(
+                                context,
+                                BackgroundSignalService::class.java
+                            ).putExtra(
+                                BackgroundSignalService.EXTRA_SYMBOL,
+                                symbol
+                            ).putExtra(
+                                BackgroundSignalService.EXTRA_INTERVAL,
+                                interval
+                            )
+
+                            if (backgroundEnabled) {
+                                intent.action =
+                                    BackgroundSignalService.ACTION_STOP
+                                context.startService(intent)
+                                backgroundEnabled = false
+                                prefs.edit()
+                                    .putBoolean("enabled", false)
+                                    .apply()
+                            } else {
+                                ContextCompat.startForegroundService(
+                                    context,
+                                    intent
+                                )
+                                backgroundEnabled = true
+                                prefs.edit()
+                                    .putBoolean("enabled", true)
+                                    .putString(PREF_SYMBOL, symbol)
+                                    .putString(PREF_INTERVAL, interval)
+                                    .apply()
                             }
-
-                            publish(true, "LIVE • XAUUSD via Biquote")
                         }
-                    }
-                } catch (e: Exception) {
-                    if (!isCurrent(myGeneration)) return@Thread
-
-                    synchronized(candles) {
-                        candles.clear()
-                    }
-
-                    publish(
-                        false,
-                        "XAUUSD tidak tersedia • chart disembunyikan"
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (backgroundEnabled) {
+                            Color(0xFF4A2530)
+                        } else {
+                            Color(0xFF17382F)
+                        }
+                    )
+                ) {
+                    Text(
+                        if (backgroundEnabled) {
+                            "Hentikan pemantauan latar belakang"
+                        } else {
+                            "Mulai pemantauan latar belakang (15 detik)"
+                        },
+                        color = if (backgroundEnabled) Red else Green
                     )
                 }
 
-                try {
-                    Thread.sleep(15_000)
-                } catch (_: InterruptedException) {
-                    return@Thread
+                Text(
+                    "Pemantauan memakai layanan Android yang berjalan dengan notifikasi permanen. Pilihan pair/timeframe disimpan saat dipilih.",
+                    color = Muted,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp
+                )
+
+                Button(
+                    onClick = {
+                        if (Build.VERSION.SDK_INT >= 33 &&
+                            !hasNotificationPermission(context)
+                        ) {
+                            notificationPermissionLauncher.launch(
+                                Manifest.permission.POST_NOTIFICATIONS
+                            )
+                        } else {
+                            notificationsEnabled = true
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF17382F)
+                    )
+                ) {
+                    Text(
+                        if (notificationsEnabled) {
+                            "Notifikasi BUY / SELL aktif ✓"
+                        } else {
+                            "Aktifkan notifikasi BUY / SELL"
+                        },
+                        color = Green
+                    )
                 }
+
+                Text(
+                    if (notificationsEnabled) {
+                        "Notifikasi aplikasi terbuka muncul saat koneksi live aktif dan sinyal berubah ke BUY/SELL pada candle tertutup."
+                    } else {
+                        "Aktifkan izin notifikasi agar HP memberi peringatan saat muncul sinyal BUY/SELL baru."
+                    },
+                    color = Muted,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp
+                )
+
+                Text(
+                    "BTCUSD memakai feed Bitstamp, pair crypto lain memakai Binance, dan XAUUSD memakai feed Biquote. Tidak melakukan transaksi otomatis. Harga antarplatform dapat berbeda karena spread, waktu pembaruan, dan sumber data.",
+                    color = Muted,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp
+                )
+
+                Spacer(Modifier.height(12.dp))
             }
-        }.start()
+        }
+    }
+}
+
+@Composable
+private fun Chip(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = { Text(label, fontSize = 11.sp) },
+        colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = Color(0xFF17382F),
+            selectedLabelColor = Green,
+            containerColor = Panel,
+            labelColor = Muted
+        )
+    )
+}
+
+@Composable
+private fun PanelCard(
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Panel)
+    ) {
+        Column(
+            modifier = Modifier.padding(15.dp),
+            verticalArrangement = Arrangement.spacedBy(11.dp),
+            content = content
+        )
+    }
+}
+
+@Composable
+private fun Metric(label: String, value: String) {
+    Column {
+        Text(label, color = Muted, fontSize = 10.sp)
+        Text(value, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+    }
+}
+
+@Composable
+private fun CandleChart(
+    modifier: Modifier,
+    data: List<Candle>
+) {
+    Canvas(modifier) {
+        if (data.isEmpty()) return@Canvas
+
+        val lo = data.minOf { it.low }
+        val hi = data.maxOf { it.high }
+        val range = max(hi - lo, 1e-9)
+        val slot = size.width / data.size
+        val body = max(2f, slot * 0.55f)
+
+        fun y(v: Double): Float =
+            size.height - (((v - lo) / range).toFloat() * size.height)
+
+        data.forEachIndexed { i, candle ->
+            val x = i * slot + slot / 2
+            val color = if (candle.close >= candle.open) Green else Red
+
+            drawLine(
+                color = color,
+                start = Offset(x, y(candle.high)),
+                end = Offset(x, y(candle.low)),
+                strokeWidth = 1.2f
+            )
+
+            val top = min(y(candle.open), y(candle.close))
+            val bottom = max(y(candle.open), y(candle.close))
+
+            drawRect(
+                color = color,
+                topLeft = Offset(x - body / 2, top),
+                size = androidx.compose.ui.geometry.Size(
+                    body,
+                    max(2f, bottom - top)
+                )
+            )
+        }
+    }
+}
+
+private fun price(v: Double): String =
+    if (v >= 1000) "%,.2f".format(v)
+    else if (v >= 1) "%.4f".format(v)
+    else "%.6f".format(v)
+
+private fun createSignalNotificationChannel(context: Context) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        val manager = context.getSystemService(
+            Context.NOTIFICATION_SERVICE
+        ) as NotificationManager
+
+        val channel = NotificationChannel(
+            SIGNAL_CHANNEL_ID,
+            "Sinyal BUY / SELL",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description =
+                "Peringatan saat sinyal crypto berubah menjadi BUY atau SELL baru"
+        }
+
+        manager.createNotificationChannel(channel)
+    }
+}
+
+private fun hasNotificationPermission(context: Context): Boolean {
+    return Build.VERSION.SDK_INT < 33 ||
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+}
+
+private fun showSignalNotification(
+    context: Context,
+    symbol: String,
+    interval: String,
+    signal: String,
+    score: Int,
+    currentPrice: Double
+) {
+    if (!hasNotificationPermission(context)) return
+
+    val manager = context.getSystemService(
+        Context.NOTIFICATION_SERVICE
+    ) as NotificationManager
+
+    val currency = when (symbol) {
+        "BTCUSD" -> "USD"
+        "XAUUSD" -> "USD"
+        else -> "USDT"
     }
 
-    // ---------------------------------------------------------
-    // Shared helpers
-    // ---------------------------------------------------------
+    val body =
+        "$symbol • $interval • skor $score/100 • harga ${price(currentPrice)} $currency"
 
-    private fun getJson(url: String): JSONObject {
-        val request = Request.Builder()
-            .url(url)
-            .header("Accept", "application/json")
-            .get()
+    val notification =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(context, SIGNAL_CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(context)
+        }
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setContentTitle("Sinyal $signal baru — $symbol")
+            .setContentText(body)
+            .setStyle(
+                Notification.BigTextStyle().bigText(
+                    "$body\nSinyal berbasis aturan teknikal, bukan jaminan profit. Periksa chart sebelum mengambil keputusan."
+                )
+            )
+            .setCategory(Notification.CATEGORY_STATUS)
+            .setAutoCancel(true)
+            .setPriority(Notification.PRIORITY_HIGH)
             .build()
 
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IllegalStateException("HTTP ${response.code}")
-            }
-
-            return JSONObject(response.body?.string() ?: "{}")
-        }
-    }
-
-    private fun isCurrent(myGeneration: Int): Boolean {
-        return !stopped && generation.get() == myGeneration
-    }
-
-    private fun publish(live: Boolean, status: String) {
-        val snapshot = synchronized(candles) {
-            candles.toList()
-        }
-
-        val myGeneration = generation.get()
-
-        main.post {
-            if (isCurrent(myGeneration)) {
-                onUpdate(snapshot, live, status)
-            }
-        }
-    }
-
-    private fun stopSocket() {
-        socket?.close(1000, "switch symbol")
-        socket = null
-    }
-
-    fun stop() {
-        stopped = true
-        generation.incrementAndGet()
-        stopSocket()
-    }
+    manager.notify((symbol + interval).hashCode(), notification)
 }
