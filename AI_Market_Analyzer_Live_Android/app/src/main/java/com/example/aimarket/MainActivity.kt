@@ -770,15 +770,29 @@ private fun JournalStat(
 
 @Composable
 private fun JournalEntryCard(entry: TradingJournal) {
-    val isWin = entry.status == TradingJournal.STATUS_TP3 ||
-        entry.status == TradingJournal.STATUS_TP2_FINAL ||
-        entry.status == TradingJournal.STATUS_TP1_FINAL
+    val isClosed = entry.status != TradingJournal.STATUS_OPEN &&
+        entry.status != TradingJournal.STATUS_CANCELLED
+
+    val finalR = entry.resultR ?: entry.realizedR
+
+    val isProfit = isClosed && finalR > 0.0
 
     val statusColor = when {
         entry.status == TradingJournal.STATUS_OPEN -> Amber
-        entry.status == TradingJournal.STATUS_SL -> Red
-        isWin -> Green
+        entry.status == TradingJournal.STATUS_SL && !isProfit -> Red
+        isProfit -> Green
+        entry.status == TradingJournal.STATUS_SL -> Amber
         else -> Muted
+    }
+
+    val closedPercent = (
+        (1.0 - entry.remainingFraction) * 100.0
+    ).coerceIn(0.0, 100.0)
+
+    val displayedR = if (isClosed) {
+        entry.resultR ?: entry.realizedR
+    } else {
+        entry.realizedR
     }
 
     Surface(
@@ -845,10 +859,35 @@ private fun JournalEntryCard(entry: TradingJournal) {
                 Metric("TP 2", price(entry.takeProfit2))
                 Metric("TP 3", entry.takeProfit3?.let(::price) ?: "—")
                 Metric(
-                    "HASIL (R)",
-                    entry.resultR?.let { "%+.2fR".format(it) } ?: "—"
+                    if (isClosed) "HASIL AKHIR" else "PROFIT SEMENTARA",
+                    "%+.2fR".format(displayedR)
                 )
             }
+
+            Text(
+                "Posisi ditutup: %.0f%% • Sisa posisi: %.0f%%".format(
+                    closedPercent,
+                    entry.remainingFraction.coerceIn(0.0, 1.0) * 100.0
+                ),
+                color = if (closedPercent > 0.0) Green else Muted,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold
+            )
+
+            LinearProgressIndicator(
+                progress = { closedPercent.toFloat() / 100f },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(6.dp),
+                color = Green,
+                trackColor = Color(0xFF283448)
+            )
+
+            Text(
+                "Alokasi: TP1 50% • TP2 30% • TP3 20%",
+                color = Muted,
+                fontSize = 10.sp
+            )
 
             Text(
                 "Sinyal: ${formatJournalTime(entry.signalTime)}",
