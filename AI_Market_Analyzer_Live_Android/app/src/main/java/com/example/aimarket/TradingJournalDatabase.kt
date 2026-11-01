@@ -9,6 +9,8 @@ import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.Update
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -52,15 +54,9 @@ interface TradingJournalDao {
         candleTime: Long
     ): TradingJournal?
 
-    // Semua entry, termasuk OPEN dan CANCELLED.
-    @Query(
-        """
-        SELECT COUNT(*) FROM trading_journal
-        """
-    )
+    @Query("SELECT COUNT(*) FROM trading_journal")
     fun observeTotalCount(): Flow<Int>
 
-    // Hanya transaksi yang benar-benar selesai.
     @Query(
         """
         SELECT COUNT(*) FROM trading_journal
@@ -74,7 +70,6 @@ interface TradingJournalDao {
     )
     fun observeClosedCount(): Flow<Int>
 
-    // Jumlah transaksi yang terkena stop loss.
     @Query(
         """
         SELECT COUNT(*) FROM trading_journal
@@ -83,7 +78,6 @@ interface TradingJournalDao {
     )
     fun observeStopLossCount(): Flow<Int>
 
-    // Jumlah transaksi yang mencapai target profit.
     @Query(
         """
         SELECT COUNT(*) FROM trading_journal
@@ -99,7 +93,7 @@ interface TradingJournalDao {
 
 @Database(
     entities = [TradingJournal::class],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class TradingJournalDatabase : RoomDatabase() {
@@ -111,6 +105,139 @@ abstract class TradingJournalDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: TradingJournalDatabase? = null
 
+        private val MIGRATION_1_2 = object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+
+                db.execSQL(
+                    """
+                    CREATE TABLE trading_journal_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        timeframe TEXT NOT NULL,
+                        direction TEXT NOT NULL,
+                        signalTime INTEGER NOT NULL,
+                        signalCandleTime INTEGER NOT NULL,
+                        entryPrice REAL NOT NULL,
+                        stopLoss REAL NOT NULL,
+                        takeProfit1 REAL NOT NULL,
+                        takeProfit2 REAL NOT NULL,
+                        takeProfit3 REAL,
+                        score INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        tp1Hit INTEGER NOT NULL,
+                        tp2Hit INTEGER NOT NULL,
+                        tp3Hit INTEGER NOT NULL,
+                        tp1ClosedFraction REAL NOT NULL,
+                        tp2ClosedFraction REAL NOT NULL,
+                        tp3ClosedFraction REAL NOT NULL,
+                        realizedR REAL NOT NULL,
+                        remainingFraction REAL NOT NULL,
+                        exitPrice REAL,
+                        exitTime INTEGER,
+                        resultR REAL,
+                        lastProcessedCandleTime INTEGER NOT NULL,
+                        note TEXT
+                    )
+                    """.trimIndent()
+                )
+
+                db.execSQL(
+                    """
+                    INSERT INTO trading_journal_new (
+                        id,
+                        symbol,
+                        timeframe,
+                        direction,
+                        signalTime,
+                        signalCandleTime,
+                        entryPrice,
+                        stopLoss,
+                        takeProfit1,
+                        takeProfit2,
+                        takeProfit3,
+                        score,
+                        status,
+                        tp1Hit,
+                        tp2Hit,
+                        tp3Hit,
+                        tp1ClosedFraction,
+                        tp2ClosedFraction,
+                        tp3ClosedFraction,
+                        realizedR,
+                        remainingFraction,
+                        exitPrice,
+                        exitTime,
+                        resultR,
+                        lastProcessedCandleTime,
+                        note
+                    )
+                    SELECT
+                        id,
+                        symbol,
+                        timeframe,
+                        direction,
+                        signalTime,
+                        signalCandleTime,
+                        entryPrice,
+                        stopLoss,
+                        takeProfit1,
+                        takeProfit2,
+                        takeProfit3,
+                        score,
+                        status,
+                        tp1Hit,
+                        tp2Hit,
+                        tp3Hit,
+                        0.50,
+                        0.30,
+                        0.20,
+                        0.0,
+                        CASE
+                            WHEN status = 'OPEN' THEN 1.0
+                            ELSE 0.0
+                        END,
+                        exitPrice,
+                        exitTime,
+                        resultR,
+                        lastProcessedCandleTime,
+                        note
+                    FROM trading_journal
+                    """.trimIndent()
+                )
+
+                db.execSQL("DROP TABLE trading_journal")
+                db.execSQL(
+                    "ALTER TABLE trading_journal_new RENAME TO trading_journal"
+                )
+
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX
+                    index_trading_journal_symbol_timeframe_signalCandleTime
+                    ON trading_journal (
+                        symbol,
+                        timeframe,
+                        signalCandleTime
+                    )
+                    """.trimIndent()
+                )
+
+                db.execSQL(
+                    """
+                    CREATE INDEX index_trading_journal_status
+                    ON trading_journal (status)
+                    """.trimIndent()
+                )
+
+                db.execSQL(
+                    """
+                    CREATE INDEX index_trading_journal_signalTime
+                    ON trading_journal (signalTime)
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): TradingJournalDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -118,6 +245,7 @@ abstract class TradingJournalDatabase : RoomDatabase() {
                     TradingJournalDatabase::class.java,
                     "trading_journal.db"
                 )
+                    .addMigrations(MIGRATION_1_2)
                     .build()
                     .also { INSTANCE = it }
             }
