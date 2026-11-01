@@ -88,13 +88,11 @@ private fun LiveAnalyzerApp() {
     var connected by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Menghubungkan…") }
     var refreshKey by remember { mutableIntStateOf(0) }
-    var observedContext by remember { mutableStateOf("") }
-    var observedSignal by remember { mutableStateOf<String?>(null) }
-    var observedClosedCandleTime by remember { mutableLongStateOf(0L) }
 
     var journalEntries by remember {
         mutableStateOf<List<TradingJournal>>(emptyList())
     }
+
     var totalJournalCount by remember { mutableIntStateOf(0) }
     var closedJournalCount by remember { mutableIntStateOf(0) }
     var stopLossCount by remember { mutableIntStateOf(0) }
@@ -121,21 +119,25 @@ private fun LiveAnalyzerApp() {
                 journalEntries = it
             }
         }
+
         launch {
             journalRepository.observeTotalCount().collectLatest {
                 totalJournalCount = it
             }
         }
+
         launch {
             journalRepository.observeClosedCount().collectLatest {
                 closedJournalCount = it
             }
         }
+
         launch {
             journalRepository.observeStopLossCount().collectLatest {
                 stopLossCount = it
             }
         }
+
         launch {
             journalRepository.observeWinningCount().collectLatest {
                 winningCount = it
@@ -162,46 +164,6 @@ private fun LiveAnalyzerApp() {
     }
 
     val lastPrice = candles.lastOrNull()?.close
-
-    LaunchedEffect(symbol, interval, candles, result) {
-        val closedCandle = candles.lastOrNull { it.closed }
-        val signal = result?.signal
-
-        if (closedCandle == null || signal == null) {
-            return@LaunchedEffect
-        }
-
-        val currentContext = "$symbol|$interval"
-
-        if (
-            observedContext != currentContext ||
-            observedClosedCandleTime == 0L
-        ) {
-            observedContext = currentContext
-            observedClosedCandleTime = closedCandle.time
-            observedSignal = signal
-            return@LaunchedEffect
-        }
-
-        if (closedCandle.time > observedClosedCandleTime) {
-            val isNewActionSignal =
-                signal in listOf("BUY", "SELL") && signal != observedSignal
-
-            if (isNewActionSignal && hasNotificationPermission(context)) {
-                showSignalNotification(
-                    context,
-                    symbol,
-                    interval,
-                    signal,
-                    result.score,
-                    result.lastPrice
-                )
-            }
-
-            observedClosedCandleTime = closedCandle.time
-            observedSignal = signal
-        }
-    }
 
     MaterialTheme(
         colorScheme = darkColorScheme(
@@ -236,6 +198,7 @@ private fun LiveAnalyzerApp() {
                             fontWeight = FontWeight.Bold,
                             letterSpacing = 2.sp
                         )
+
                         Text(
                             "AI Market Analyzer",
                             fontSize = 23.sp,
@@ -274,7 +237,9 @@ private fun LiveAnalyzerApp() {
                     )
 
                     Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        modifier = Modifier.horizontalScroll(
+                            rememberScrollState()
+                        ),
                         horizontalArrangement = Arrangement.spacedBy(7.dp)
                     ) {
                         listOf(
@@ -300,16 +265,19 @@ private fun LiveAnalyzerApp() {
 
                 PanelCard {
                     Text(symbol, color = Muted, fontSize = 13.sp)
+
                     Text(
                         lastPrice?.let(::price) ?: "Menunggu data…",
                         fontSize = 29.sp,
                         fontWeight = FontWeight.Bold
                     )
+
                     Text(
                         status,
                         color = if (connected) Green else Amber,
                         fontSize = 11.sp
                     )
+
                     Spacer(Modifier.height(4.dp))
 
                     if (symbol == "XAUUSD" && !connected) {
@@ -324,6 +292,7 @@ private fun LiveAnalyzerApp() {
                             Modifier.fillMaxWidth().height(145.dp),
                             candles.takeLast(70)
                         )
+
                         Text(
                             when (symbol) {
                                 "BTCUSD" -> "Harga BTC/USD • sumber Bitstamp • candle tertutup untuk analisis"
@@ -410,6 +379,7 @@ private fun LiveAnalyzerApp() {
                         }
 
                         HorizontalDivider(color = Color(0xFF283448))
+
                         Text("Alasan sinyal", fontWeight = FontWeight.Bold)
 
                         result.reasons.forEach { reason ->
@@ -438,6 +408,7 @@ private fun LiveAnalyzerApp() {
                                 if (waiting) "WAIT"
                                 else result.entryPrice?.let(::price) ?: "—"
                             )
+
                             Metric(
                                 "Stop Loss",
                                 if (waiting) "WAIT"
@@ -454,11 +425,13 @@ private fun LiveAnalyzerApp() {
                                 if (waiting) "WAIT"
                                 else result.takeProfit1?.let(::price) ?: "—"
                             )
+
                             Metric(
                                 "TP 2",
                                 if (waiting) "WAIT"
                                 else result.takeProfit2?.let(::price) ?: "—"
                             )
+
                             Metric(
                                 "TP 3",
                                 if (waiting) "WAIT"
@@ -493,6 +466,7 @@ private fun LiveAnalyzerApp() {
                         fontSize = 16.sp,
                         fontWeight = FontWeight.ExtraBold
                     )
+
                     Text(
                         "Riwayat sinyal virtual dari database lokal di HP.",
                         color = Muted,
@@ -515,6 +489,7 @@ private fun LiveAnalyzerApp() {
                             Green,
                             Modifier.weight(1f)
                         )
+
                         JournalStat(
                             "OPEN",
                             (totalJournalCount - closedJournalCount)
@@ -522,6 +497,7 @@ private fun LiveAnalyzerApp() {
                             Amber,
                             Modifier.weight(1f)
                         )
+
                         JournalStat(
                             "SELESAI",
                             closedJournalCount.toString(),
@@ -540,12 +516,14 @@ private fun LiveAnalyzerApp() {
                             Green,
                             Modifier.weight(1f)
                         )
+
                         JournalStat(
                             "STOP LOSS",
                             stopLossCount.toString(),
                             Red,
                             Modifier.weight(1f)
                         )
+
                         JournalStat(
                             "WIN RATE",
                             "%.1f%%".format(winRate),
@@ -557,12 +535,15 @@ private fun LiveAnalyzerApp() {
                     Text("Filter riwayat", color = Muted, fontSize = 12.sp)
 
                     Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        modifier = Modifier.horizontalScroll(
+                            rememberScrollState()
+                        ),
                         horizontalArrangement = Arrangement.spacedBy(7.dp)
                     ) {
                         Chip("PAIR AKTIF", journalFilter == "PAIR AKTIF") {
                             journalFilter = "PAIR AKTIF"
                         }
+
                         Chip("SEMUA PAIR", journalFilter == "SEMUA PAIR") {
                             journalFilter = "SEMUA PAIR"
                         }
@@ -626,13 +607,22 @@ private fun LiveAnalyzerApp() {
                             )
 
                             if (backgroundEnabled) {
-                                intent.action = BackgroundSignalService.ACTION_STOP
+                                intent.action =
+                                    BackgroundSignalService.ACTION_STOP
+
                                 context.startService(intent)
                                 backgroundEnabled = false
-                                prefs.edit().putBoolean("enabled", false).apply()
+                                prefs.edit()
+                                    .putBoolean("enabled", false)
+                                    .apply()
                             } else {
-                                ContextCompat.startForegroundService(context, intent)
+                                ContextCompat.startForegroundService(
+                                    context,
+                                    intent
+                                )
+
                                 backgroundEnabled = true
+
                                 prefs.edit()
                                     .putBoolean("enabled", true)
                                     .putString(PREF_SYMBOL, symbol)
@@ -697,9 +687,9 @@ private fun LiveAnalyzerApp() {
 
                 Text(
                     if (notificationsEnabled) {
-                        "Notifikasi aplikasi terbuka muncul saat koneksi live aktif dan sinyal berubah ke BUY/SELL pada candle tertutup."
+                        "Notifikasi entry baru dikelola oleh layanan pemantauan latar belakang agar tidak terjadi notifikasi ganda."
                     } else {
-                        "Aktifkan izin notifikasi agar HP memberi peringatan saat muncul sinyal BUY/SELL baru."
+                        "Aktifkan izin notifikasi agar HP dapat memberi peringatan saat layanan pemantauan menemukan entry baru."
                     },
                     color = Muted,
                     fontSize = 11.sp,
@@ -741,6 +731,7 @@ private fun JournalStat(
                 fontSize = 9.sp,
                 fontWeight = FontWeight.Bold
             )
+
             Text(
                 value,
                 color = color,
@@ -784,6 +775,7 @@ private fun JournalEntryCard(entry: TradingJournal) {
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp
                     )
+
                     Text(
                         "${entry.direction} • Skor ${entry.score}/100",
                         color = if (entry.direction == "BUY") Green else Red,
@@ -879,6 +871,7 @@ private fun displayJournalStatus(entry: TradingJournal): String {
                 else -> "OPEN"
             }
         }
+
         TradingJournal.STATUS_TP3 -> "TP3 SELESAI"
         TradingJournal.STATUS_TP2_FINAL -> "TP2 SELESAI"
         TradingJournal.STATUS_TP1_FINAL -> "TP1 SELESAI"
@@ -998,7 +991,7 @@ private fun createSignalNotificationChannel(context: Context) {
             NotificationManager.IMPORTANCE_HIGH
         ).apply {
             description =
-                "Peringatan saat sinyal crypto berubah menjadi BUY atau SELL baru"
+                "Peringatan saat entry BUY atau SELL baru berhasil dicatat"
         }
 
         manager.createNotificationChannel(channel)
@@ -1011,49 +1004,4 @@ private fun hasNotificationPermission(context: Context): Boolean {
             context,
             Manifest.permission.POST_NOTIFICATIONS
         ) == PackageManager.PERMISSION_GRANTED
-}
-
-private fun showSignalNotification(
-    context: Context,
-    symbol: String,
-    interval: String,
-    signal: String,
-    score: Int,
-    currentPrice: Double
-) {
-    if (!hasNotificationPermission(context)) return
-
-    val manager = context.getSystemService(
-        Context.NOTIFICATION_SERVICE
-    ) as NotificationManager
-
-    val currency = when (symbol) {
-        "BTCUSD", "XAUUSD" -> "USD"
-        else -> "USDT"
-    }
-
-    val body =
-        "$symbol • $interval • skor $score/100 • harga ${price(currentPrice)} $currency"
-
-    val notification =
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(context, SIGNAL_CHANNEL_ID)
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(context)
-        }
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("Sinyal $signal baru — $symbol")
-            .setContentText(body)
-            .setStyle(
-                Notification.BigTextStyle().bigText(
-                    "$body\nSinyal berbasis aturan teknikal, bukan jaminan profit. Periksa chart sebelum mengambil keputusan."
-                )
-            )
-            .setCategory(Notification.CATEGORY_STATUS)
-            .setAutoCancel(true)
-            .setPriority(Notification.PRIORITY_HIGH)
-            .build()
-
-    manager.notify((symbol + interval).hashCode(), notification)
 }
