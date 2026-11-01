@@ -94,7 +94,6 @@ class BackgroundSignalService : Service() {
                 return@LiveMarketRepository
             }
 
-            // Selalu gunakan candle tertutup untuk evaluasi hasil virtual.
             val closedCandles = candles
                 .filter { it.closed }
                 .sortedBy { it.time }
@@ -103,9 +102,7 @@ class BackgroundSignalService : Service() {
                 return@LiveMarketRepository
             }
 
-            // Proses seluruh candle yang tersedia.
-            // Repository jurnal mengabaikan candle yang sudah diproses,
-            // candle sebelum entry, serta posisi yang sudah selesai.
+            // Evaluasi hasil entry lama pada candle yang sudah tertutup.
             for (candle in closedCandles) {
                 serviceScope.launch {
                     try {
@@ -119,27 +116,23 @@ class BackgroundSignalService : Service() {
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        Log.e(
-                            TAG,
-                            "Gagal memproses candle jurnal",
-                            e
-                        )
+                        Log.e(TAG, "Gagal memproses candle jurnal", e)
                     }
                 }
             }
 
             val newestClosed = closedCandles.last()
 
-            // Jangan menganalisis candle yang sama lebih dari sekali.
             if (newestClosed.time <= lastClosedTime) {
                 return@LiveMarketRepository
             }
 
-            val analysis = AnalysisEngine.analyze(closedCandles)
-                ?: run {
-                    lastClosedTime = newestClosed.time
-                    return@LiveMarketRepository
-                }
+            val analysis =
+                AnalysisEngine.analyze(closedCandles)
+                    ?: run {
+                        lastClosedTime = newestClosed.time
+                        return@LiveMarketRepository
+                    }
 
             lastClosedTime = newestClosed.time
 
@@ -150,7 +143,6 @@ class BackgroundSignalService : Service() {
                 return@LiveMarketRepository
             }
 
-            // Kirim sinyal hanya ketika arah berubah dari sinyal terakhir.
             if (signal == lastSignal) {
                 return@LiveMarketRepository
             }
@@ -172,9 +164,8 @@ class BackgroundSignalService : Service() {
                 return@LiveMarketRepository
             }
 
-            // Catat sinyal di database lokal.
-            // Indeks unik di database mencegah candle yang sama
-            // tercatat dua kali untuk simbol dan timeframe yang sama.
+            // Penyimpanan memeriksa entry OPEN secara transaksional.
+            // Notifikasi hanya dikirim jika entry baru berhasil disimpan.
             serviceScope.launch {
                 try {
                     val insertedId = journal.recordSignal(
@@ -192,8 +183,26 @@ class BackgroundSignalService : Service() {
                     )
 
                     if (insertedId > 0L) {
+                        lastSignal = signal
+
                         updateStatus(
                             "Jurnal mencatat $symbol $signal • $interval"
+                        )
+
+                        sendSignalNotification(
+                            symbol = symbol,
+                            signal = signal,
+                            entry = entry,
+                            sl = sl,
+                            tp1 = tp1,
+                            tp2 = tp2,
+                            tp3 = tp3,
+                            score = analysis.score
+                        )
+                    } else {
+                        updateStatus(
+                            "$symbol • $interval masih memiliki entry OPEN; " +
+                                "entry baru diblokir"
                         )
                     }
                 } catch (e: CancellationException) {
@@ -203,19 +212,6 @@ class BackgroundSignalService : Service() {
                     updateStatus("Gagal menyimpan sinyal ke jurnal")
                 }
             }
-
-            lastSignal = signal
-
-            sendSignalNotification(
-                symbol = symbol,
-                signal = signal,
-                entry = entry,
-                sl = sl,
-                tp1 = tp1,
-                tp2 = tp2,
-                tp3 = tp3,
-                score = analysis.score
-            )
         }
 
         repository?.start(symbol, interval)
@@ -246,15 +242,15 @@ class BackgroundSignalService : Service() {
 
         val body =
             "$symbol $signal • Skor $score\n" +
-            "Entry: ${price(entry)}\n" +
-            "SL: ${price(sl)}\n" +
-            "TP1: ${price(tp1)}\n" +
-            "TP2: ${price(tp2)}\n" +
-            "TP3: $tp3Text"
+                "Entry: ${price(entry)}\n" +
+                "SL: ${price(sl)}\n" +
+                "TP1: ${price(tp1)}\n" +
+                "TP2: ${price(tp2)}\n" +
+                "TP3: $tp3Text"
 
         if (!notificationsAllowed()) {
             updateStatus(
-                "Sinyal $signal terdeteksi, tetapi izin notifikasi belum aktif"
+                "Entry tersimpan, tetapi izin notifikasi belum aktif"
             )
             return
         }
@@ -262,7 +258,7 @@ class BackgroundSignalService : Service() {
         val notification =
             NotificationCompat.Builder(this, SIGNAL_CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentTitle("Sinyal baru: $signal")
+                .setContentTitle("Sinyal entry baru: $signal")
                 .setContentText("$symbol • Entry ${price(entry)}")
                 .setStyle(
                     NotificationCompat.BigTextStyle().bigText(body)
@@ -277,7 +273,9 @@ class BackgroundSignalService : Service() {
                 notification
             )
         } catch (_: SecurityException) {
-            updateStatus("Izin notifikasi ditolak di pengaturan Android")
+            updateStatus(
+                "Izin notifikasi ditolak di pengaturan Android"
+            )
         }
     }
 
@@ -302,7 +300,7 @@ class BackgroundSignalService : Service() {
                 statusNotification(text)
             )
         } catch (_: SecurityException) {
-            // Masalah izin notifikasi tidak boleh menghentikan service.
+            // Izin notifikasi tidak boleh menghentikan service.
         }
     }
 
