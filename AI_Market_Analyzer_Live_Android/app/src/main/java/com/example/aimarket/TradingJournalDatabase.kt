@@ -52,17 +52,29 @@ interface TradingJournalDao {
         candleTime: Long
     ): TradingJournal?
 
-    @Query("SELECT COUNT(*) FROM trading_journal")
-    fun observeTotalCount(): Flow<Int>
-
+    // Semua entry, termasuk OPEN dan CANCELLED.
     @Query(
         """
         SELECT COUNT(*) FROM trading_journal
-        WHERE status != 'OPEN'
+        """
+    )
+    fun observeTotalCount(): Flow<Int>
+
+    // Hanya transaksi yang benar-benar selesai.
+    @Query(
+        """
+        SELECT COUNT(*) FROM trading_journal
+        WHERE status IN (
+            'SL',
+            'TP3',
+            'TP2_FINAL',
+            'TP1_FINAL'
+        )
         """
     )
     fun observeClosedCount(): Flow<Int>
 
+    // Jumlah transaksi yang terkena stop loss.
     @Query(
         """
         SELECT COUNT(*) FROM trading_journal
@@ -71,10 +83,15 @@ interface TradingJournalDao {
     )
     fun observeStopLossCount(): Flow<Int>
 
+    // Jumlah transaksi yang mencapai target profit.
     @Query(
         """
         SELECT COUNT(*) FROM trading_journal
-        WHERE status IN ('TP3', 'TP2_FINAL', 'TP1_FINAL')
+        WHERE status IN (
+            'TP3',
+            'TP2_FINAL',
+            'TP1_FINAL'
+        )
         """
     )
     fun observeWinningCount(): Flow<Int>
@@ -90,6 +107,7 @@ abstract class TradingJournalDatabase : RoomDatabase() {
     abstract fun journalDao(): TradingJournalDao
 
     companion object {
+
         @Volatile
         private var INSTANCE: TradingJournalDatabase? = null
 
