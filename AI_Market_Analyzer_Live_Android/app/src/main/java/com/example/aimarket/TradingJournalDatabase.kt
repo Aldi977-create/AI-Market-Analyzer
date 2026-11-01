@@ -82,10 +82,13 @@ interface TradingJournalDao {
         """
         SELECT COUNT(*) FROM trading_journal
         WHERE status IN (
+            'SL',
             'TP3',
             'TP2_FINAL',
             'TP1_FINAL'
         )
+        AND resultR IS NOT NULL
+        AND resultR > 0
         """
     )
     fun observeWinningCount(): Flow<Int>
