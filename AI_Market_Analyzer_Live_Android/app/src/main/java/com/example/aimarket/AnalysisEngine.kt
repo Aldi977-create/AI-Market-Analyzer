@@ -38,7 +38,12 @@ object AnalysisEngine {
     private data class Pivot(val index: Int, val price: Double)
 
     fun analyze(candles: List<Candle>): AnalysisResult? {
-        val stable = candles.filter { it.closed }.takeLast(300)
+        val stable = candles
+            .filter { it.closed && isValidCandle(it) }
+            .distinctBy { it.time }
+            .sortedBy { it.time }
+            .takeLast(300)
+
         if (stable.size < 52) return null
 
         val closes = stable.map { it.close }
@@ -52,6 +57,14 @@ object AnalysisEngine {
         val atrValue = atr(stable, 14)
         val macdValue =
             (ema(closes, 12) ?: last) - (ema(closes, 26) ?: last)
+
+        if (
+            !last.isFinite() || last <= 0.0 ||
+            !e9.isFinite() || !e21.isFinite() || !e50.isFinite() ||
+            !macdValue.isFinite()
+        ) {
+            return null
+        }
 
         val atr = atrValue?.takeIf { it > 0.0 && it.isFinite() }
         val reasons = mutableListOf<String>()
@@ -183,14 +196,16 @@ object AnalysisEngine {
             }
         }
 
-        val recentVolumes = stable.takeLast(21).dropLast(1)
+        val recentVolumes = stable.takeLast(21)
+            .dropLast(1)
             .map { it.volume }
             .filter { it > 0.0 && it.isFinite() }
 
         if (recentVolumes.size >= 10 && lastCandle.volume > 0.0) {
             val averageVolume = recentVolumes.average()
 
-            if (averageVolume > 0.0 &&
+            if (
+                averageVolume > 0.0 &&
                 lastCandle.volume >= averageVolume * 1.5
             ) {
                 when {
@@ -228,7 +243,6 @@ object AnalysisEngine {
 
         score = score.coerceIn(0, 100)
 
-        // Filter sinyal asli tetap dipertahankan.
         val bullishSetup =
             bullishTrend || (e9 > e21 && bullishBreakout)
         val bearishSetup =
@@ -274,10 +288,9 @@ object AnalysisEngine {
 
             val risk = abs(last - calculatedStop)
 
-            if (risk > 0.0 && risk.isFinite()) {
+            if (risk > 0.0 && risk.isFinite() && calculatedStop.isFinite()) {
                 stop = calculatedStop
 
-                // TP1 dan TP2 selalu dihitung dari risiko yang sama.
                 val target1 = last + direction * risk
                 val target2 = last + direction * risk * 2.0
                 val target3 = last + direction * risk * 3.0
@@ -291,7 +304,6 @@ object AnalysisEngine {
                     support?.takeIf { it < last }
                 }
 
-                // TP3 hanya ditampilkan jika ruang menuju target cukup.
                 val target3IsPlausible = if (obstacle == null) {
                     true
                 } else {
@@ -303,7 +315,7 @@ object AnalysisEngine {
                     }
                 }
 
-                if (target3IsPlausible) {
+                if (target3IsPlausible && target3.isFinite()) {
                     tp3 = target3
                 }
 
@@ -313,6 +325,7 @@ object AnalysisEngine {
                 if (obstacle != null) {
                     val distanceToObstacle = abs(obstacle - last)
                     reasons += "Terdapat support/resistance terdekat pada ${"%.5f".format(obstacle)}."
+
                     if (distanceToObstacle < risk * 2.0) {
                         reasons += "Peringatan: hambatan harga berada sebelum atau dekat TP2. TP tetap estimasi, bukan jaminan tercapai."
                     } else {
@@ -354,6 +367,23 @@ object AnalysisEngine {
             takeProfit2 = tp2,
             takeProfit3 = tp3
         )
+    }
+
+    private fun isValidCandle(candle: Candle): Boolean {
+        return candle.time > 0L &&
+            candle.open.isFinite() &&
+            candle.high.isFinite() &&
+            candle.low.isFinite() &&
+            candle.close.isFinite() &&
+            candle.volume.isFinite() &&
+            candle.open > 0.0 &&
+            candle.high > 0.0 &&
+            candle.low > 0.0 &&
+            candle.close > 0.0 &&
+            candle.high >= max(candle.open, candle.close) &&
+            candle.low <= min(candle.open, candle.close) &&
+            candle.high >= candle.low &&
+            candle.volume >= 0.0
     }
 
     private fun findPivotHighs(
@@ -416,7 +446,7 @@ object AnalysisEngine {
             value = alpha * x + (1.0 - alpha) * value
         }
 
-        return value
+        return value.takeIf { it.isFinite() }
     }
 
     private fun rsi(values: List<Double>, period: Int): Double? {
@@ -441,11 +471,14 @@ object AnalysisEngine {
                 (averageLoss * (period - 1) + max(-change, 0.0)) / period
         }
 
+        if (!averageGain.isFinite() || !averageLoss.isFinite()) return null
         if (averageLoss == 0.0) return 100.0
 
-        return 100.0 - 100.0 / (
+        val value = 100.0 - 100.0 / (
             1.0 + averageGain / averageLoss
         )
+
+        return value.takeIf { it.isFinite() }
     }
 
     private fun atr(
@@ -464,6 +497,7 @@ object AnalysisEngine {
             )
         }
 
-        return trueRanges.takeLast(period).average()
+        val value = trueRanges.takeLast(period).average()
+        return value.takeIf { it > 0.0 && it.isFinite() }
     }
 }
