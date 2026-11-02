@@ -33,10 +33,17 @@ class BackgroundSignalService : Service() {
 
     private lateinit var journal: TradingJournalRepository
 
+    @Volatile
     private var lastClosedTime = 0L
 
+    @Volatile
     private var activeSymbol = "BTCUSDT"
+
+    @Volatile
     private var activeInterval = "1m"
+
+    @Volatile
+    private var feedGeneration = 0
 
     override fun onCreate() {
         super.onCreate()
@@ -63,33 +70,57 @@ class BackgroundSignalService : Service() {
         val prefs =
             getSharedPreferences("market_monitor", MODE_PRIVATE)
 
-        activeSymbol = intent?.getStringExtra(EXTRA_SYMBOL)
-            ?: prefs.getString("symbol", "BTCUSDT")
-            ?: "BTCUSDT"
+        val symbol = (
+            intent?.getStringExtra(EXTRA_SYMBOL)
+                ?: prefs.getString("symbol", "BTCUSDT")
+                ?: "BTCUSDT"
+            ).trim().uppercase(Locale.US)
 
-        activeInterval = intent?.getStringExtra(EXTRA_INTERVAL)
-            ?: prefs.getString("interval", "1m")
-            ?: "1m"
+        val interval = (
+            intent?.getStringExtra(EXTRA_INTERVAL)
+                ?: prefs.getString("interval", "1m")
+                ?: "1m"
+            ).trim()
+
+        if (symbol.isBlank() || interval.isBlank()) {
+            updateStatus("Simbol atau timeframe tidak valid")
+            return START_NOT_STICKY
+        }
+
+        activeSymbol = symbol
+        activeInterval = interval
 
         prefs.edit()
             .putBoolean("enabled", true)
-            .putString("symbol", activeSymbol)
-            .putString("interval", activeInterval)
+            .putString("symbol", symbol)
+            .putString("interval", interval)
             .apply()
+
+        // Invalidasi callback feed sebelumnya sebelum mengganti feed.
+        val myFeedGeneration = synchronized(this) {
+            feedGeneration += 1
+            feedGeneration
+        }
 
         repository?.stop()
         repository = null
-
         lastClosedTime = 0L
 
-        val symbol = activeSymbol
-        val interval = activeInterval
+        updateStatus("Memulai pemantauan $symbol • $interval")
 
         repository = LiveMarketRepository { candles, live, message ->
 
+            // Callback dari repository lama tidak boleh memproses data.
+            if (!isCurrentFeed(myFeedGeneration, symbol, interval)) {
+                return@LiveMarketRepository
+            }
+
             updateStatus(
-                if (live) "Memantau $symbol • $interval"
-                else message
+                if (live) {
+                    "Memantau $symbol • $interval"
+                } else {
+                    message
+                }
             )
 
             if (candles.isEmpty()) {
@@ -98,17 +129,49 @@ class BackgroundSignalService : Service() {
 
             serviceScope.launch {
                 processingMutex.withLock {
+                    if (!isCurrentFeed(
+                            myFeedGeneration,
+                            symbol,
+                            interval
+                        )
+                    ) {
+                        return@withLock
+                    }
+
                     try {
                         val closedCandles = candles
+                            .asSequence()
                             .filter { it.closed }
+                            .filter {
+                                it.time > 0L &&
+                                    it.high.isFinite() &&
+                                    it.low.isFinite() &&
+                                    it.high > 0.0 &&
+                                    it.low > 0.0 &&
+                                    it.high >= it.low
+                            }
+                            .distinctBy { it.time }
                             .sortedBy { it.time }
+                            .toList()
 
                         if (closedCandles.isEmpty()) {
                             return@withLock
                         }
 
-                        // Candle diproses berurutan, satu kali per waktu.
+                        // Proses candle tertutup secara kronologis.
+                        // Repository jurnal juga memeriksa waktu sinyal
+                        // dan lastProcessedCandleTime sebagai perlindungan
+                        // tambahan terhadap pemrosesan berulang.
                         for (candle in closedCandles) {
+                            if (!isCurrentFeed(
+                                    myFeedGeneration,
+                                    symbol,
+                                    interval
+                                )
+                            ) {
+                                return@withLock
+                            }
+
                             if (candle.time <= lastClosedTime) {
                                 continue
                             }
@@ -121,7 +184,18 @@ class BackgroundSignalService : Service() {
                                 low = candle.low
                             )
 
+                            // Perbarui checkpoint setelah pemrosesan jurnal
+                            // berhasil diselesaikan.
                             lastClosedTime = candle.time
+                        }
+
+                        if (!isCurrentFeed(
+                                myFeedGeneration,
+                                symbol,
+                                interval
+                            )
+                        ) {
+                            return@withLock
                         }
 
                         val newestClosed = closedCandles.last()
@@ -133,14 +207,15 @@ class BackgroundSignalService : Service() {
                         val signal =
                             analysis.signal.uppercase(Locale.US)
 
-                        if (signal != TradingJournal.DIRECTION_BUY &&
+                        if (
+                            signal != TradingJournal.DIRECTION_BUY &&
                             signal != TradingJournal.DIRECTION_SELL
                         ) {
                             return@withLock
                         }
 
-                        // Posisi aktif tetap menjadi prioritas.
-                        // Jangan mencatat entry baru saat masih OPEN.
+                        // Jangan membuat posisi baru selama posisi lama
+                        // masih OPEN pada simbol dan timeframe ini.
                         if (journal.hasOpenEntry(symbol, interval)) {
                             return@withLock
                         }
@@ -154,12 +229,49 @@ class BackgroundSignalService : Service() {
                         val tp3 = analysis.takeProfit3
 
                         if (
-                            !entry.isFinite() || entry <= 0.0 ||
-                            sl == null || !sl.isFinite() ||
-                            tp1 == null || !tp1.isFinite() ||
-                            tp2 == null || !tp2.isFinite()
+                            !entry.isFinite() ||
+                            entry <= 0.0 ||
+                            sl == null ||
+                            !sl.isFinite() ||
+                            tp1 == null ||
+                            !tp1.isFinite() ||
+                            tp2 == null ||
+                            !tp2.isFinite()
                         ) {
-                            updateStatus("Level sinyal $signal tidak valid")
+                            updateStatus(
+                                "Level sinyal $signal tidak valid"
+                            )
+                            return@withLock
+                        }
+
+                        // Pastikan level entry dan target sesuai arah.
+                        val levelsValid =
+                            if (signal == TradingJournal.DIRECTION_BUY) {
+                                sl < entry &&
+                                    tp1 > entry &&
+                                    tp2 > tp1 &&
+                                    (tp3 == null || (
+                                        tp3.isFinite() && tp3 > tp2
+                                    ))
+                            } else {
+                                sl > entry &&
+                                    tp1 < entry &&
+                                    tp2 < tp1 &&
+                                    (tp3 == null || (
+                                        tp3.isFinite() && tp3 < tp2
+                                    ))
+                            }
+
+                        if (!levelsValid) {
+                            updateStatus(
+                                "Level sinyal $signal tidak konsisten"
+                            )
+                            return@withLock
+                        }
+
+                        // Hindari mencatat sinyal dari candle yang sudah
+                        // bukan candle terbaru pada feed aktif.
+                        if (newestClosed.time <= 0L) {
                             return@withLock
                         }
 
@@ -178,6 +290,15 @@ class BackgroundSignalService : Service() {
                         )
 
                         if (insertedId > 0L) {
+                            if (!isCurrentFeed(
+                                    myFeedGeneration,
+                                    symbol,
+                                    interval
+                                )
+                            ) {
+                                return@withLock
+                            }
+
                             updateStatus(
                                 "Jurnal mencatat $symbol $signal • $interval"
                             )
@@ -194,12 +315,21 @@ class BackgroundSignalService : Service() {
                                 score = analysis.score
                             )
                         }
-
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
                         Log.e(TAG, "Gagal memproses market", e)
-                        updateStatus("Terjadi kesalahan pemrosesan market")
+
+                        if (isCurrentFeed(
+                                myFeedGeneration,
+                                symbol,
+                                interval
+                            )
+                        ) {
+                            updateStatus(
+                                "Terjadi kesalahan pemrosesan market"
+                            )
+                        }
                     }
                 }
             }
@@ -208,6 +338,18 @@ class BackgroundSignalService : Service() {
         repository?.start(symbol, interval)
 
         return START_STICKY
+    }
+
+    private fun isCurrentFeed(
+        expectedGeneration: Int,
+        symbol: String,
+        interval: String
+    ): Boolean {
+        return synchronized(this) {
+            feedGeneration == expectedGeneration &&
+                activeSymbol.equals(symbol, ignoreCase = true) &&
+                activeInterval.equals(interval, ignoreCase = true)
+        }
     }
 
     private fun notificationId(entryId: Long): Int =
@@ -331,6 +473,10 @@ class BackgroundSignalService : Service() {
     }
 
     private fun stopMonitoring() {
+        synchronized(this) {
+            feedGeneration += 1
+        }
+
         repository?.stop()
         repository = null
 
@@ -350,6 +496,10 @@ class BackgroundSignalService : Service() {
     }
 
     override fun onDestroy() {
+        synchronized(this) {
+            feedGeneration += 1
+        }
+
         repository?.stop()
         repository = null
         serviceScope.cancel()
