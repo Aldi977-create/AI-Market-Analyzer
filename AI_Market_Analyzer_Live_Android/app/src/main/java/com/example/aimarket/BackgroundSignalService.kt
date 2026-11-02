@@ -34,7 +34,6 @@ class BackgroundSignalService : Service() {
     private lateinit var journal: TradingJournalRepository
 
     private var lastClosedTime = 0L
-    private var lastSignal: String? = null
 
     private var activeSymbol = "BTCUSDT"
     private var activeInterval = "1m"
@@ -82,7 +81,6 @@ class BackgroundSignalService : Service() {
         repository = null
 
         lastClosedTime = 0L
-        lastSignal = null
 
         val symbol = activeSymbol
         val interval = activeInterval
@@ -98,7 +96,6 @@ class BackgroundSignalService : Service() {
                 return@LiveMarketRepository
             }
 
-            // Semua pemrosesan candle diserialkan agar urutannya terjaga.
             serviceScope.launch {
                 processingMutex.withLock {
                     try {
@@ -110,7 +107,7 @@ class BackgroundSignalService : Service() {
                             return@withLock
                         }
 
-                        // Proses candle lama satu per satu.
+                        // Candle diproses berurutan, satu kali per waktu.
                         for (candle in closedCandles) {
                             if (candle.time <= lastClosedTime) {
                                 continue
@@ -136,13 +133,15 @@ class BackgroundSignalService : Service() {
                         val signal =
                             analysis.signal.uppercase(Locale.US)
 
-                        if (signal != "BUY" && signal != "SELL") {
-                            lastSignal = signal
+                        if (signal != TradingJournal.DIRECTION_BUY &&
+                            signal != TradingJournal.DIRECTION_SELL
+                        ) {
                             return@withLock
                         }
 
-                        // Hindari sinyal yang sama berulang pada candle berikutnya.
-                        if (signal == lastSignal) {
+                        // Posisi aktif tetap menjadi prioritas.
+                        // Jangan mencatat entry baru saat masih OPEN.
+                        if (journal.hasOpenEntry(symbol, interval)) {
                             return@withLock
                         }
 
@@ -160,7 +159,6 @@ class BackgroundSignalService : Service() {
                             tp1 == null || !tp1.isFinite() ||
                             tp2 == null || !tp2.isFinite()
                         ) {
-                            lastSignal = signal
                             updateStatus("Level sinyal $signal tidak valid")
                             return@withLock
                         }
@@ -179,10 +177,6 @@ class BackgroundSignalService : Service() {
                             score = analysis.score
                         )
 
-                        // Simpan sinyal terakhir meskipun entry diblokir.
-                        // Ini mencegah percobaan berulang untuk arah yang sama.
-                        lastSignal = signal
-
                         if (insertedId > 0L) {
                             updateStatus(
                                 "Jurnal mencatat $symbol $signal • $interval"
@@ -198,11 +192,6 @@ class BackgroundSignalService : Service() {
                                 tp2 = tp2,
                                 tp3 = tp3,
                                 score = analysis.score
-                            )
-                        } else {
-                            updateStatus(
-                                "$symbol • $interval memiliki entry OPEN " +
-                                    "atau sinyal tidak dapat disimpan"
                             )
                         }
 
@@ -221,11 +210,8 @@ class BackgroundSignalService : Service() {
         return START_STICKY
     }
 
-    private fun notificationId(entryId: Long): Int {
-        return (entryId % Int.MAX_VALUE)
-            .toInt()
-            .coerceAtLeast(1)
-    }
+    private fun notificationId(entryId: Long): Int =
+        (entryId % Int.MAX_VALUE).toInt().coerceAtLeast(1)
 
     private fun sendSignalNotification(
         notificationId: Int,
@@ -247,15 +233,13 @@ class BackgroundSignalService : Service() {
         fun price(value: Double): String =
             String.format(Locale.US, "%.${decimals}f", value)
 
-        val tp3Text = tp3?.let { price(it) } ?: "Tidak tersedia"
-
         val body =
             "$symbol $signal • Skor $score\n" +
                 "Entry: ${price(entry)}\n" +
                 "SL: ${price(sl)}\n" +
                 "TP1: ${price(tp1)}\n" +
                 "TP2: ${price(tp2)}\n" +
-                "TP3: $tp3Text"
+                "TP3: ${tp3?.let { price(it) } ?: "Tidak tersedia"}"
 
         if (!notificationsAllowed()) {
             updateStatus(
@@ -368,9 +352,7 @@ class BackgroundSignalService : Service() {
     override fun onDestroy() {
         repository?.stop()
         repository = null
-
         serviceScope.cancel()
-
         super.onDestroy()
     }
 
