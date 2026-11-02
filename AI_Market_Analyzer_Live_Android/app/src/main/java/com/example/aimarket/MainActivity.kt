@@ -188,6 +188,32 @@ private fun LiveAnalyzerApp() {
         it.status == TradingJournal.STATUS_OPEN
     }
 
+    // Prioritaskan posisi OPEN yang cocok dengan pair dan timeframe aktif.
+    val activeJournal = journalEntries
+        .asSequence()
+        .filter {
+            it.status == TradingJournal.STATUS_OPEN &&
+                it.symbol.equals(symbol, ignoreCase = true) &&
+                it.timeframe.equals(interval, ignoreCase = true)
+        }
+        .maxByOrNull { it.signalTime }
+
+    // Sinyal jurnal tetap ditampilkan selama posisi virtual masih OPEN.
+    val shownSignal = when {
+        activeJournal != null -> activeJournal.direction
+        symbol == "XAUUSD" && !connected -> "MARKET CLOSED"
+        result != null -> result.signal
+        else -> "ANALYZING"
+    }
+
+    val shownScore = activeJournal?.score ?: result?.score
+
+    val shownEntry = activeJournal?.entryPrice ?: result?.entryPrice
+    val shownStop = activeJournal?.stopLoss ?: result?.stopLoss
+    val shownTp1 = activeJournal?.takeProfit1 ?: result?.takeProfit1
+    val shownTp2 = activeJournal?.takeProfit2 ?: result?.takeProfit2
+    val shownTp3 = activeJournal?.takeProfit3 ?: result?.takeProfit3
+
     MaterialTheme(
         colorScheme = darkColorScheme(
             background = Bg,
@@ -305,7 +331,7 @@ private fun LiveAnalyzerApp() {
 
                     if (symbol == "XAUUSD" && !connected) {
                         Text(
-                            "Chart dan sinyal XAUUSD disembunyikan karena pasar tutup, data kedaluwarsa, atau feed belum tersedia. Coba refresh saat pasar aktif.",
+                            "Feed XAUUSD belum tersedia atau tidak terhubung. Posisi jurnal yang masih OPEN tetap ditampilkan, tetapi harga live belum tentu tersedia.",
                             color = Amber,
                             fontSize = 12.sp,
                             lineHeight = 17.sp
@@ -340,13 +366,6 @@ private fun LiveAnalyzerApp() {
                             fontSize = 16.sp
                         )
 
-                        val shownSignal =
-                            if (symbol == "XAUUSD" && !connected) {
-                                "MARKET CLOSED"
-                            } else {
-                                result?.signal ?: "ANALYZING"
-                            }
-
                         Surface(
                             color = when (shownSignal) {
                                 "BUY" -> Color(0xFF17382F)
@@ -371,23 +390,58 @@ private fun LiveAnalyzerApp() {
                         }
                     }
 
-                    Text(
-                        if (result == null) {
-                            "Mengumpulkan minimal 52 candle tertutup untuk analisis."
-                        } else {
-                            "Skor aturan teknikal: ${result.score}/100"
-                        },
-                        color = Muted,
-                        fontSize = 12.sp
-                    )
-
-                    if (symbol == "XAUUSD" && !connected) {
+                    if (activeJournal != null) {
                         Text(
-                            "Tidak ada sinyal baru saat pasar tutup atau data XAUUSD tidak valid.",
+                            "POSISI VIRTUAL MASIH OPEN • Sinyal ${activeJournal.direction} dipertahankan dari Trading Journal sampai posisi ditutup.",
+                            color = Green,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+
+                        Text(
+                            "Level entry, SL, dan TP di bawah berasal dari posisi jurnal yang aktif, bukan dari perhitungan sinyal terbaru.",
+                            color = Muted,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
+                        )
+
+                        if (activeJournal.tp1Hit || activeJournal.tp2Hit || activeJournal.tp3Hit) {
+                            Text(
+                                "Target tercapai: " + buildList {
+                                    if (activeJournal.tp1Hit) add("TP1")
+                                    if (activeJournal.tp2Hit) add("TP2")
+                                    if (activeJournal.tp3Hit) add("TP3")
+                                }.joinToString(", ") +
+                                    " • Sisa posisi %.0f%%".format(
+                                        activeJournal.remainingFraction.coerceIn(0.0, 1.0) * 100.0
+                                    ),
+                                color = Amber,
+                                fontSize = 11.sp
+                            )
+                        }
+                    } else {
+                        Text(
+                            when {
+                                result == null ->
+                                    "Mengumpulkan minimal 52 candle tertutup untuk analisis."
+                                else ->
+                                    "Skor aturan teknikal: ${result.score}/100"
+                            },
                             color = Muted,
                             fontSize = 12.sp
                         )
-                    } else if (result != null) {
+                    }
+
+                    if (activeJournal == null && symbol == "XAUUSD" && !connected) {
+                        Text(
+                            "Tidak ada sinyal baru saat feed XAUUSD tidak tersedia.",
+                            color = Muted,
+                            fontSize = 12.sp
+                        )
+                    }
+
+                    if (result != null && connected) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
@@ -400,10 +454,12 @@ private fun LiveAnalyzerApp() {
                             Metric("EMA 21", result.ema21?.let(::price) ?: "—")
                             Metric("EMA 50", result.ema50?.let(::price) ?: "—")
                         }
+                    }
 
+                    if (activeJournal == null && result != null && connected) {
                         HorizontalDivider(color = Color(0xFF283448))
 
-                        Text("Alasan sinyal", fontWeight = FontWeight.Bold)
+                        Text("Alasan sinyal terbaru", fontWeight = FontWeight.Bold)
 
                         result.reasons.forEach { reason ->
                             Text(
@@ -413,69 +469,101 @@ private fun LiveAnalyzerApp() {
                                 lineHeight = 17.sp
                             )
                         }
-
-                        val waiting = result.signal == "WAIT"
-
+                    } else if (activeJournal != null && !activeJournal.note.isNullOrBlank()) {
+                        HorizontalDivider(color = Color(0xFF283448))
+                        Text("Catatan posisi", fontWeight = FontWeight.Bold)
                         Text(
-                            "LEVEL ENTRY & TARGET",
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
+                            activeJournal.note!!,
+                            color = Muted,
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp
+                        )
+                    }
+
+                    val hasActivePosition = activeJournal != null
+                    val waiting = !hasActivePosition &&
+                        (result == null || result.signal == "WAIT")
+
+                    Text(
+                        "LEVEL ENTRY & TARGET",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Metric(
+                            "Entry",
+                            if (waiting) "WAIT"
+                            else shownEntry?.let(::price) ?: "—"
                         )
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Metric(
-                                "Entry",
-                                if (waiting) "WAIT"
-                                else result.entryPrice?.let(::price) ?: "—"
-                            )
+                        Metric(
+                            "Stop Loss",
+                            if (waiting) "WAIT"
+                            else shownStop?.let(::price) ?: "—"
+                        )
+                    }
 
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Metric(
+                            "TP 1",
+                            if (waiting) "WAIT"
+                            else shownTp1?.let(::price) ?: "—"
+                        )
+
+                        Metric(
+                            "TP 2",
+                            if (waiting) "WAIT"
+                            else shownTp2?.let(::price) ?: "—"
+                        )
+
+                        Metric(
+                            "TP 3",
+                            if (waiting) "WAIT"
+                            else shownTp3?.let(::price) ?: "—"
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Metric(
+                            "ATR 14",
+                            result?.atr?.let(::price) ?: "—"
+                        )
+                        if (activeJournal != null) {
                             Metric(
-                                "Stop Loss",
-                                if (waiting) "WAIT"
-                                else result.stopLoss?.let(::price) ?: "—"
+                                "HASIL BERJALAN",
+                                "%+.2fR".format(activeJournal.realizedR)
                             )
                         }
+                    }
 
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Metric(
-                                "TP 1",
-                                if (waiting) "WAIT"
-                                else result.takeProfit1?.let(::price) ?: "—"
-                            )
-
-                            Metric(
-                                "TP 2",
-                                if (waiting) "WAIT"
-                                else result.takeProfit2?.let(::price) ?: "—"
-                            )
-
-                            Metric(
-                                "TP 3",
-                                if (waiting) "WAIT"
-                                else result.takeProfit3?.let(::price) ?: "—"
-                            )
-                        }
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Metric("ATR 14", result.atr?.let(::price) ?: "—")
-                        }
-
-                        Text(
-                            if (waiting) {
-                                "WAIT berarti belum ada konfirmasi yang cukup. Level entry, SL, dan TP belum diberikan."
-                            } else {
+                    Text(
+                        when {
+                            activeJournal != null ->
+                                "Posisi virtual masih OPEN. Level jurnal dipertahankan; harga live dapat berubah dan hasil virtual bukan hasil transaksi broker."
+                            waiting ->
+                                "WAIT berarti belum ada konfirmasi yang cukup. Level entry, SL, dan TP untuk sinyal baru belum tersedia."
+                            else ->
                                 "*Level estimasi berbasis ATR dan volatilitas timeframe; bukan instruksi order. Harga eksekusi dapat berbeda. Periksa spread, biaya, dan risiko."
-                            },
-                            color = Amber,
+                        },
+                        color = Amber,
+                        fontSize = 10.sp,
+                        lineHeight = 15.sp
+                    )
+
+                    if (shownScore != null && activeJournal != null) {
+                        Text(
+                            "Skor saat sinyal dicatat: $shownScore/100",
+                            color = Muted,
                             fontSize = 10.sp
                         )
                     }
@@ -774,7 +862,6 @@ private fun JournalEntryCard(entry: TradingJournal) {
         entry.status != TradingJournal.STATUS_CANCELLED
 
     val finalR = entry.resultR ?: entry.realizedR
-
     val isProfit = isClosed && finalR > 0.0
 
     val statusColor = when {
