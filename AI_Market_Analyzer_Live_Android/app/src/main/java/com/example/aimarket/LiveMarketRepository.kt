@@ -57,29 +57,17 @@ class LiveMarketRepository(
 
         when (currentSymbol) {
             "XAUUSD" -> {
-                publish(
-                    myGeneration,
-                    false,
-                    "Menghubungkan ke feed XAUUSD…"
-                )
+                publish(myGeneration, false, "Menghubungkan ke feed XAUUSD…")
                 startGoldFeed(myGeneration)
             }
 
             "BTCUSD" -> {
-                publish(
-                    myGeneration,
-                    false,
-                    "Menghubungkan ke Bitstamp BTC/USD…"
-                )
+                publish(myGeneration, false, "Menghubungkan ke Bitstamp BTC/USD…")
                 startBitstampFeed(myGeneration)
             }
 
             else -> {
-                publish(
-                    myGeneration,
-                    false,
-                    "Memuat candle historis Binance…"
-                )
+                publish(myGeneration, false, "Memuat candle historis Binance…")
                 startBinanceFeed(myGeneration)
             }
         }
@@ -145,13 +133,18 @@ class LiveMarketRepository(
             }
 
             synchronized(candles) {
-                // Gabungkan historis dengan data socket yang mungkin
-                // sudah masuk. Candle socket yang lebih baru dipertahankan.
                 val byTime = candles.associateBy { it.time }.toMutableMap()
 
                 parsed.forEach { historical ->
-                    if (!byTime.containsKey(historical.time)) {
+                    val existing = byTime[historical.time]
+
+                    // Pertahankan candle yang sudah diperbarui socket.
+                    // Jika candle historis menandakan candle sudah tutup,
+                    // jangan menimpa candle socket yang lebih baru.
+                    if (existing == null) {
                         byTime[historical.time] = historical
+                    } else if (historical.closed && !existing.closed) {
+                        byTime[historical.time] = existing
                     }
                 }
 
@@ -159,6 +152,12 @@ class LiveMarketRepository(
                 candles.addAll(
                     byTime.values.sortedBy { it.time }.takeLast(300)
                 )
+            }
+
+            // Penting: publikasikan candle hasil pemulihan historis,
+            // agar pemroses jurnal dapat mengejar candle yang terlewat.
+            if (isCurrent(myGeneration)) {
+                publish(myGeneration, true, "LIVE • Binance • historis diperbarui")
             }
 
             true
@@ -193,11 +192,7 @@ class LiveMarketRepository(
                     response: okhttp3.Response
                 ) {
                     if (isCurrent(myGeneration)) {
-                        publish(
-                            myGeneration,
-                            true,
-                            "LIVE • Binance WebSocket"
-                        )
+                        publish(myGeneration, true, "LIVE • Binance WebSocket")
                     } else {
                         webSocket.close(1000, "Koneksi sudah diganti")
                     }
@@ -312,11 +307,16 @@ class LiveMarketRepository(
             Thread {
                 if (!isCurrent(myGeneration)) return@Thread
 
-                // Ambil ulang historis sebelum membuka socket baru.
-                loadBinanceHistory(myGeneration)
+                // Pulihkan candle historis dan publikasikan hasilnya
+                // sebelum membuka WebSocket kembali.
+                val historyLoaded = loadBinanceHistory(myGeneration)
 
                 if (isCurrent(myGeneration)) {
-                    connectSocket(myGeneration)
+                    if (historyLoaded) {
+                        connectSocket(myGeneration)
+                    } else {
+                        scheduleBinanceReconnect(myGeneration, 5000)
+                    }
                 }
             }.start()
         }, delayMs)
@@ -470,8 +470,6 @@ class LiveMarketRepository(
                     val age = tick.optLong("quoteAgeSeconds", Long.MAX_VALUE)
 
                     if (marketState != "open" || stale || age > 300L) {
-                        // Jangan menghapus candle historis hanya karena
-                        // feed sementara gagal atau pasar sedang tutup.
                         publish(
                             myGeneration,
                             false,
