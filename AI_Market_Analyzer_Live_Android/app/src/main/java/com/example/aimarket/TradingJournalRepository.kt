@@ -29,8 +29,7 @@ class TradingJournalRepository(context: Context) {
         dao.observeWinningCount()
 
     /**
-     * Memeriksa apakah masih ada posisi OPEN untuk simbol
-     * dan timeframe tertentu.
+     * Memeriksa posisi OPEN untuk simbol dan timeframe tertentu.
      */
     suspend fun hasOpenEntry(
         symbol: String,
@@ -57,7 +56,6 @@ class TradingJournalRepository(context: Context) {
         takeProfit3: Double?,
         score: Int
     ): Long {
-
         if (
             direction != TradingJournal.DIRECTION_BUY &&
             direction != TradingJournal.DIRECTION_SELL
@@ -111,8 +109,7 @@ class TradingJournalRepository(context: Context) {
         if (!fractionsValid) return -1L
 
         return database.withTransaction {
-
-            // Hindari duplikasi sinyal dari candle yang sama.
+            // Hindari sinyal duplikat dari candle yang sama.
             if (
                 dao.findSignal(
                     symbol,
@@ -123,13 +120,13 @@ class TradingJournalRepository(context: Context) {
                 return@withTransaction -1L
             }
 
-            // Hanya satu posisi OPEN per simbol dan timeframe.
-            val hasOpenEntry = dao.getOpenEntries().any {
+            // Satu posisi OPEN per simbol dan timeframe.
+            val alreadyOpen = dao.getOpenEntries().any {
                 it.symbol.equals(symbol, ignoreCase = true) &&
                     it.timeframe.equals(timeframe, ignoreCase = true)
             }
 
-            if (hasOpenEntry) {
+            if (alreadyOpen) {
                 return@withTransaction -1L
             }
 
@@ -152,10 +149,13 @@ class TradingJournalRepository(context: Context) {
     }
 
     /**
-     * Memproses candle tertutup.
+     * Memproses satu candle yang sudah tertutup.
      *
-     * Jika SL dan satu atau beberapa TP tersentuh dalam
-     * candle yang sama, SL diprioritaskan untuk sisa posisi.
+     * Candle sebelum atau sama dengan candle sinyal tidak boleh
+     * memengaruhi hasil posisi tersebut.
+     *
+     * Jika SL dan TP tersentuh dalam candle yang sama, SL
+     * diprioritaskan untuk sisa posisi sebagai kebijakan konservatif.
      */
     suspend fun processClosedCandle(
         symbol: String,
@@ -176,22 +176,22 @@ class TradingJournalRepository(context: Context) {
         ) return
 
         database.withTransaction {
-            val entries = dao.getOpenEntries().filter {
-                it.symbol.equals(symbol, ignoreCase = true) &&
-                    it.timeframe.equals(timeframe, ignoreCase = true) &&
-                    candleTime > it.signalCandleTime &&
-                    candleTime > it.lastProcessedCandleTime
+            val entries = dao.getOpenEntries().filter { entry ->
+                entry.symbol.equals(symbol, ignoreCase = true) &&
+                    entry.timeframe.equals(timeframe, ignoreCase = true) &&
+                    candleTime > entry.signalCandleTime &&
+                    candleTime > entry.lastProcessedCandleTime
             }
 
             for (entry in entries) {
-                dao.update(
-                    processCandle(
-                        entry = entry,
-                        candleTime = candleTime,
-                        high = high,
-                        low = low
-                    )
+                val updated = processCandle(
+                    entry = entry,
+                    candleTime = candleTime,
+                    high = high,
+                    low = low
                 )
+
+                dao.update(updated)
             }
         }
     }
@@ -202,7 +202,6 @@ class TradingJournalRepository(context: Context) {
         high: Double,
         low: Double
     ): TradingJournal {
-
         val isBuy =
             entry.direction == TradingJournal.DIRECTION_BUY
 
@@ -229,16 +228,23 @@ class TradingJournalRepository(context: Context) {
         } ?: false
 
         var realizedR = entry.realizedR
-        var remaining = entry.remainingFraction.coerceIn(0.0, 1.0)
+        var remaining =
+            entry.remainingFraction.coerceIn(0.0, 1.0)
 
         var tp1Hit = entry.tp1Hit
         var tp2Hit = entry.tp2Hit
         var tp3Hit = entry.tp3Hit
 
-        // SL diprioritaskan untuk seluruh sisa posisi.
-        // TP yang baru tersentuh pada candle ini tidak dibukukan.
+        // SL menutup seluruh sisa posisi.
+        // TP baru pada candle yang sama tidak dihitung terlebih dahulu.
         if (stopHit) {
             val stopResult = realizedR - remaining
+
+            val simultaneousTarget =
+                (!tp1Hit && tp1HitNow) ||
+                    (!tp2Hit && tp2HitNow) ||
+                    (entry.takeProfit3 != null &&
+                        !tp3Hit && tp3HitNow)
 
             return entry.copy(
                 status = TradingJournal.STATUS_SL,
@@ -248,7 +254,7 @@ class TradingJournalRepository(context: Context) {
                 remainingFraction = 0.0,
                 resultR = stopResult,
                 lastProcessedCandleTime = candleTime,
-                note = if (tp1HitNow || tp2HitNow || tp3HitNow) {
+                note = if (simultaneousTarget) {
                     "SL dan TP tersentuh pada candle yang sama; SL diprioritaskan untuk sisa posisi"
                 } else {
                     entry.note
@@ -256,7 +262,7 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
-        // TP1 merealisasikan 50% posisi awal.
+        // TP1 menutup 50% dari posisi awal.
         if (!tp1Hit && tp1HitNow) {
             val fraction = minOf(
                 entry.tp1ClosedFraction.coerceIn(0.0, 1.0),
@@ -266,11 +272,11 @@ class TradingJournalRepository(context: Context) {
             realizedR += fraction *
                 calculateR(entry, entry.takeProfit1)
 
-            remaining -= fraction
+            remaining = (remaining - fraction).coerceAtLeast(0.0)
             tp1Hit = true
         }
 
-        // TP2 merealisasikan 30% posisi awal.
+        // TP2 menutup 30% dari posisi awal.
         if (!tp2Hit && tp2HitNow) {
             val fraction = minOf(
                 entry.tp2ClosedFraction.coerceIn(0.0, 1.0),
@@ -280,23 +286,24 @@ class TradingJournalRepository(context: Context) {
             realizedR += fraction *
                 calculateR(entry, entry.takeProfit2)
 
-            remaining -= fraction
+            remaining = (remaining - fraction).coerceAtLeast(0.0)
             tp2Hit = true
         }
 
-        // TP3 menutup seluruh sisa posisi.
+        // TP3 menutup semua sisa posisi.
         if (
             entry.takeProfit3 != null &&
             !tp3Hit &&
             tp3HitNow
         ) {
             val target = entry.takeProfit3
+
             realizedR += remaining * calculateR(entry, target)
 
             return entry.copy(
                 status = TradingJournal.STATUS_TP3,
-                tp1Hit = tp1Hit || tp1HitNow,
-                tp2Hit = tp2Hit || tp2HitNow,
+                tp1Hit = tp1Hit,
+                tp2Hit = tp2Hit,
                 tp3Hit = true,
                 realizedR = realizedR,
                 remainingFraction = 0.0,
@@ -307,7 +314,7 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
-        // Tanpa TP3, TP2 menutup seluruh sisa posisi.
+        // Jika tidak ada TP3, TP2 menutup seluruh sisa posisi.
         if (entry.takeProfit3 == null && tp2Hit) {
             if (remaining > 0.0) {
                 realizedR += remaining *
@@ -327,6 +334,7 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
+        // Simpan checkpoint candle terakhir yang sudah diproses.
         return entry.copy(
             tp1Hit = tp1Hit,
             tp2Hit = tp2Hit,
