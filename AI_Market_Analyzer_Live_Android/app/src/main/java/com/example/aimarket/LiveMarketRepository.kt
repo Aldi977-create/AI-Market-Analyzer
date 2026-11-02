@@ -109,20 +109,32 @@ class LiveMarketRepository(
                 }
 
                 val arr = JSONArray(response.body?.string() ?: "[]")
+                val now = System.currentTimeMillis()
 
                 for (i in 0 until arr.length()) {
                     val k = arr.getJSONArray(i)
+                    val openTime = k.getLong(0)
                     val closeTime = k.getLong(6)
+
+                    val open = k.getString(1).toDouble()
+                    val high = k.getString(2).toDouble()
+                    val low = k.getString(3).toDouble()
+                    val close = k.getString(4).toDouble()
+                    val volume = k.getString(5).toDouble()
+
+                    if (!validCandle(openTime, open, high, low, close)) {
+                        continue
+                    }
 
                     parsed.add(
                         Candle(
-                            time = k.getLong(0),
-                            open = k.getString(1).toDouble(),
-                            high = k.getString(2).toDouble(),
-                            low = k.getString(3).toDouble(),
-                            close = k.getString(4).toDouble(),
-                            volume = k.getString(5).toDouble(),
-                            closed = closeTime < System.currentTimeMillis()
+                            time = openTime,
+                            open = open,
+                            high = high,
+                            low = low,
+                            close = close,
+                            volume = volume,
+                            closed = closeTime < now
                         )
                     )
                 }
@@ -138,13 +150,23 @@ class LiveMarketRepository(
                 parsed.forEach { historical ->
                     val existing = byTime[historical.time]
 
-                    // Pertahankan candle yang sudah diperbarui socket.
-                    // Jika candle historis menandakan candle sudah tutup,
-                    // jangan menimpa candle socket yang lebih baru.
-                    if (existing == null) {
-                        byTime[historical.time] = historical
-                    } else if (historical.closed && !existing.closed) {
-                        byTime[historical.time] = existing
+                    when {
+                        existing == null -> {
+                            byTime[historical.time] = historical
+                        }
+
+                        historical.closed -> {
+                            // Data historis mengonfirmasi candle telah tutup.
+                            // Gunakan data historis agar status closed tidak
+                            // tertahan false jika socket belum mengirim update.
+                            byTime[historical.time] = historical
+                        }
+
+                        else -> {
+                            // Candle historis masih berjalan. Pertahankan
+                            // candle socket yang sudah ada jika tersedia.
+                            byTime[historical.time] = existing
+                        }
                     }
                 }
 
@@ -154,10 +176,12 @@ class LiveMarketRepository(
                 )
             }
 
-            // Penting: publikasikan candle hasil pemulihan historis,
-            // agar pemroses jurnal dapat mengejar candle yang terlewat.
             if (isCurrent(myGeneration)) {
-                publish(myGeneration, true, "LIVE • Binance • historis diperbarui")
+                publish(
+                    myGeneration,
+                    true,
+                    "LIVE • Binance • historis diperbarui"
+                )
             }
 
             true
@@ -192,7 +216,11 @@ class LiveMarketRepository(
                     response: okhttp3.Response
                 ) {
                     if (isCurrent(myGeneration)) {
-                        publish(myGeneration, true, "LIVE • Binance WebSocket")
+                        publish(
+                            myGeneration,
+                            true,
+                            "LIVE • Binance WebSocket"
+                        )
                     } else {
                         webSocket.close(1000, "Koneksi sudah diganti")
                     }
@@ -207,9 +235,10 @@ class LiveMarketRepository(
                     try {
                         val root = JSONObject(text)
                         val k = root.getJSONObject("k")
+                        val time = k.getLong("t")
 
                         val candle = Candle(
-                            time = k.getLong("t"),
+                            time = time,
                             open = k.getString("o").toDouble(),
                             high = k.getString("h").toDouble(),
                             low = k.getString("l").toDouble(),
@@ -218,12 +247,32 @@ class LiveMarketRepository(
                             closed = k.getBoolean("x")
                         )
 
+                        if (!validCandle(
+                                candle.time,
+                                candle.open,
+                                candle.high,
+                                candle.low,
+                                candle.close
+                            )
+                        ) {
+                            return
+                        }
+
                         synchronized(candles) {
                             val index =
                                 candles.indexOfLast { it.time == candle.time }
 
                             if (index >= 0) {
-                                candles[index] = candle
+                                val existing = candles[index]
+
+                                // Jangan menurunkan status candle yang sudah
+                                // ditandai tutup menjadi candle berjalan.
+                                candles[index] =
+                                    if (existing.closed && !candle.closed) {
+                                        existing
+                                    } else {
+                                        candle
+                                    }
                             } else {
                                 candles.add(candle)
                             }
@@ -307,8 +356,6 @@ class LiveMarketRepository(
             Thread {
                 if (!isCurrent(myGeneration)) return@Thread
 
-                // Pulihkan candle historis dan publikasikan hasilnya
-                // sebelum membuka WebSocket kembali.
                 val historyLoaded = loadBinanceHistory(myGeneration)
 
                 if (isCurrent(myGeneration)) {
@@ -335,10 +382,14 @@ class LiveMarketRepository(
                     )
 
                     val data = ohlcRoot.optJSONObject("data")
-                        ?: throw IllegalStateException("Respons OHLC tidak valid")
+                        ?: throw IllegalStateException(
+                            "Respons OHLC tidak valid"
+                        )
 
                     val bars = data.optJSONArray("ohlc")
-                        ?: throw IllegalStateException("Candle BTCUSD tidak tersedia")
+                        ?: throw IllegalStateException(
+                            "Candle BTCUSD tidak tersedia"
+                        )
 
                     val ticker = getJson(
                         "https://www.bitstamp.net/api/v2/ticker/btcusd/"
@@ -346,10 +397,14 @@ class LiveMarketRepository(
 
                     val lastPrice = ticker.optString("last")
                         .toDoubleOrNull()
-                        ?: throw IllegalStateException("Harga ticker tidak valid")
+                        ?: throw IllegalStateException(
+                            "Harga ticker tidak valid"
+                        )
 
                     if (!lastPrice.isFinite() || lastPrice <= 0.0) {
-                        throw IllegalStateException("Harga BTCUSD tidak valid")
+                        throw IllegalStateException(
+                            "Harga BTCUSD tidak valid"
+                        )
                     }
 
                     val now = System.currentTimeMillis()
@@ -359,6 +414,11 @@ class LiveMarketRepository(
                         val bar = bars.optJSONObject(i) ?: continue
                         val seconds = bar.optString("timestamp")
                             .toLongOrNull() ?: continue
+
+                        if (seconds <= 0L ||
+                            seconds > Long.MAX_VALUE / 1000L
+                        ) continue
+
                         val time = seconds * 1000L
 
                         val open = bar.optString("open").toDoubleOrNull()
@@ -372,12 +432,9 @@ class LiveMarketRepository(
                         val volume = bar.optString("volume")
                             .toDoubleOrNull() ?: 0.0
 
-                        if (
-                            !open.isFinite() || !high.isFinite() ||
-                            !low.isFinite() || !close.isFinite() ||
-                            open <= 0.0 || high < low || low <= 0.0 ||
-                            close <= 0.0
-                        ) continue
+                        if (!validCandle(time, open, high, low, close)) {
+                            continue
+                        }
 
                         parsed.add(
                             Candle(
@@ -393,7 +450,9 @@ class LiveMarketRepository(
                     }
 
                     if (parsed.isEmpty()) {
-                        throw IllegalStateException("Belum ada candle BTCUSD")
+                        throw IllegalStateException(
+                            "Belum ada candle BTCUSD"
+                        )
                     }
 
                     parsed.sortBy { it.time }
@@ -412,7 +471,7 @@ class LiveMarketRepository(
                             volume = old.volume,
                             closed = false
                         )
-                    } else {
+                    } else if (bucket >= parsed.last().time) {
                         val previousClose = parsed.last().close
                         parsed.add(
                             Candle(
@@ -435,7 +494,11 @@ class LiveMarketRepository(
                         candles.addAll(parsed.takeLast(300))
                     }
 
-                    publish(myGeneration, true, "LIVE • BTC/USD • Bitstamp")
+                    publish(
+                        myGeneration,
+                        true,
+                        "LIVE • BTC/USD • Bitstamp"
+                    )
                 } catch (e: Exception) {
                     if (!isCurrent(myGeneration)) return@Thread
 
@@ -467,7 +530,10 @@ class LiveMarketRepository(
                     val marketState =
                         tick.optString("marketState", "unknown").lowercase()
                     val stale = tick.optBoolean("stale", true)
-                    val age = tick.optLong("quoteAgeSeconds", Long.MAX_VALUE)
+                    val age = tick.optLong(
+                        "quoteAgeSeconds",
+                        Long.MAX_VALUE
+                    )
 
                     if (marketState != "open" || stale || age > 300L) {
                         publish(
@@ -481,29 +547,30 @@ class LiveMarketRepository(
                                 "?interval=$currentInterval&limit=120"
                         )
 
-                        val bars = candleJson.optJSONArray("bars") ?: JSONArray()
+                        val bars = candleJson.optJSONArray("bars")
+                            ?: JSONArray()
                         val parsed = mutableListOf<Candle>()
+                        val now = System.currentTimeMillis()
 
                         for (i in 0 until bars.length()) {
                             val bar = bars.optJSONObject(i) ?: continue
 
-                            val timeText = bar.optString("openTime")
-                            val time = try {
-                                Instant.parse(timeText).toEpochMilli()
-                            } catch (_: Exception) {
-                                timeText.toLongOrNull() ?: continue
-                            }
+                            val timeText = bar.optString("openTime").trim()
+                            val time = parseTimestampMillis(timeText) ?: continue
+
+                            // Tolak waktu tidak valid atau terlalu jauh di
+                            // masa depan, tetapi toleransi 60 detik diberikan
+                            // untuk perbedaan jam antarserver.
+                            if (time > now + 60_000L) continue
 
                             val open = bar.optDouble("open", Double.NaN)
                             val high = bar.optDouble("high", Double.NaN)
                             val low = bar.optDouble("low", Double.NaN)
                             val close = bar.optDouble("close", Double.NaN)
 
-                            if (
-                                !open.isFinite() || !high.isFinite() ||
-                                !low.isFinite() || !close.isFinite() ||
-                                open <= 0.0 || low <= 0.0 || high < low
-                            ) continue
+                            if (!validCandle(time, open, high, low, close)) {
+                                continue
+                            }
 
                             parsed.add(
                                 Candle(
@@ -516,7 +583,10 @@ class LiveMarketRepository(
                                         "tickVolume",
                                         bar.optDouble("volume", 0.0)
                                     ),
-                                    closed = !bar.optBoolean("isOpen", false)
+                                    closed = !bar.optBoolean(
+                                        "isOpen",
+                                        false
+                                    )
                                 )
                             )
                         }
@@ -530,11 +600,18 @@ class LiveMarketRepository(
                                 "Feed XAUUSD aktif, candle belum tersedia"
                             )
                         } else {
-                            parsed.sortBy { it.time }
+                            // Hindari timestamp duplikat dan urutkan candle.
+                            val unique = parsed
+                                .groupBy { it.time }
+                                .map { (_, items) ->
+                                    items.last()
+                                }
+                                .sortedBy { it.time }
+                                .takeLast(300)
 
                             synchronized(candles) {
                                 candles.clear()
-                                candles.addAll(parsed.takeLast(300))
+                                candles.addAll(unique)
                             }
 
                             publish(
@@ -562,6 +639,58 @@ class LiveMarketRepository(
                 }
             }
         }.start()
+    }
+
+    /**
+     * Biquote biasanya mengirim openTime sebagai ISO-8601 UTC.
+     * Fallback numerik menerima timestamp dalam detik atau milidetik.
+     */
+    private fun parseTimestampMillis(value: String): Long? {
+        if (value.isBlank()) return null
+
+        try {
+            return Instant.parse(value).toEpochMilli()
+        } catch (_: Exception) {
+            // Lanjutkan ke format numerik.
+        }
+
+        val numeric = value.toLongOrNull() ?: return null
+        if (numeric <= 0L) return null
+
+        return when {
+            numeric < 100_000_000_000L -> {
+                if (numeric > Long.MAX_VALUE / 1000L) {
+                    null
+                } else {
+                    numeric * 1000L
+                }
+            }
+
+            else -> numeric
+        }
+    }
+
+    private fun validCandle(
+        time: Long,
+        open: Double,
+        high: Double,
+        low: Double,
+        close: Double
+    ): Boolean {
+        return time > 0L &&
+            open.isFinite() &&
+            high.isFinite() &&
+            low.isFinite() &&
+            close.isFinite() &&
+            open > 0.0 &&
+            high > 0.0 &&
+            low > 0.0 &&
+            close > 0.0 &&
+            high >= low &&
+            high >= open &&
+            high >= close &&
+            low <= open &&
+            low <= close
     }
 
     private fun intervalToSeconds(interval: String): Int {
