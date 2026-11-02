@@ -78,6 +78,11 @@ private fun LiveAnalyzerApp() {
         mutableStateOf(prefs.getBoolean("enabled", false))
     }
 
+    // Menandai bahwa dialog izin diminta dari tombol pemantauan background.
+    var pendingBackgroundStart by remember {
+        mutableStateOf(false)
+    }
+
     var symbol by remember {
         mutableStateOf(prefs.getString(PREF_SYMBOL, "BTCUSD") ?: "BTCUSD")
     }
@@ -104,8 +109,34 @@ private fun LiveAnalyzerApp() {
     val notificationPermissionLauncher =
         rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestPermission()
-        ) {
+        ) { granted ->
             notificationsEnabled = hasNotificationPermission(context)
+
+            // Jika izin diberikan dari tombol background, langsung mulai service.
+            if (granted && pendingBackgroundStart) {
+                val intent = android.content.Intent(
+                    context,
+                    BackgroundSignalService::class.java
+                ).putExtra(
+                    BackgroundSignalService.EXTRA_SYMBOL,
+                    symbol
+                ).putExtra(
+                    BackgroundSignalService.EXTRA_INTERVAL,
+                    interval
+                )
+
+                ContextCompat.startForegroundService(context, intent)
+
+                backgroundEnabled = true
+
+                prefs.edit()
+                    .putBoolean("enabled", true)
+                    .putString(PREF_SYMBOL, symbol)
+                    .putString(PREF_INTERVAL, interval)
+                    .apply()
+            }
+
+            pendingBackgroundStart = false
         }
 
     DisposableEffect(context, prefs) {
@@ -207,7 +238,6 @@ private fun LiveAnalyzerApp() {
     }
 
     val shownScore = activeJournal?.score ?: result?.score
-
     val shownEntry = activeJournal?.entryPrice ?: result?.entryPrice
     val shownStop = activeJournal?.stopLoss ?: result?.stopLoss
     val shownTp1 = activeJournal?.takeProfit1 ?: result?.takeProfit1
@@ -286,9 +316,7 @@ private fun LiveAnalyzerApp() {
                     )
 
                     Row(
-                        modifier = Modifier.horizontalScroll(
-                            rememberScrollState()
-                        ),
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(7.dp)
                     ) {
                         listOf(
@@ -446,10 +474,7 @@ private fun LiveAnalyzerApp() {
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Metric(
-                                "RSI 14",
-                                result.rsi?.let { "%.1f".format(it) } ?: "—"
-                            )
+                            Metric("RSI 14", result.rsi?.let { "%.1f".format(it) } ?: "—")
                             Metric("EMA 9", result.ema9?.let(::price) ?: "—")
                             Metric("EMA 21", result.ema21?.let(::price) ?: "—")
                             Metric("EMA 50", result.ema50?.let(::price) ?: "—")
@@ -458,7 +483,6 @@ private fun LiveAnalyzerApp() {
 
                     if (activeJournal == null && result != null && connected) {
                         HorizontalDivider(color = Color(0xFF283448))
-
                         Text("Alasan sinyal terbaru", fontWeight = FontWeight.Bold)
 
                         result.reasons.forEach { reason ->
@@ -494,55 +518,26 @@ private fun LiveAnalyzerApp() {
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Metric(
-                            "Entry",
-                            if (waiting) "WAIT"
-                            else shownEntry?.let(::price) ?: "—"
-                        )
-
-                        Metric(
-                            "Stop Loss",
-                            if (waiting) "WAIT"
-                            else shownStop?.let(::price) ?: "—"
-                        )
+                        Metric("Entry", if (waiting) "WAIT" else shownEntry?.let(::price) ?: "—")
+                        Metric("Stop Loss", if (waiting) "WAIT" else shownStop?.let(::price) ?: "—")
                     }
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Metric(
-                            "TP 1",
-                            if (waiting) "WAIT"
-                            else shownTp1?.let(::price) ?: "—"
-                        )
-
-                        Metric(
-                            "TP 2",
-                            if (waiting) "WAIT"
-                            else shownTp2?.let(::price) ?: "—"
-                        )
-
-                        Metric(
-                            "TP 3",
-                            if (waiting) "WAIT"
-                            else shownTp3?.let(::price) ?: "—"
-                        )
+                        Metric("TP 1", if (waiting) "WAIT" else shownTp1?.let(::price) ?: "—")
+                        Metric("TP 2", if (waiting) "WAIT" else shownTp2?.let(::price) ?: "—")
+                        Metric("TP 3", if (waiting) "WAIT" else shownTp3?.let(::price) ?: "—")
                     }
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Metric(
-                            "ATR 14",
-                            result?.atr?.let(::price) ?: "—"
-                        )
+                        Metric("ATR 14", result?.atr?.let(::price) ?: "—")
                         if (activeJournal != null) {
-                            Metric(
-                                "HASIL BERJALAN",
-                                "%+.2fR".format(activeJournal.realizedR)
-                            )
+                            Metric("HASIL BERJALAN", "%+.2fR".format(activeJournal.realizedR))
                         }
                     }
 
@@ -594,66 +589,29 @@ private fun LiveAnalyzerApp() {
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        JournalStat(
-                            "TOTAL",
-                            totalJournalCount.toString(),
-                            Green,
-                            Modifier.weight(1f)
-                        )
-
-                        JournalStat(
-                            "OPEN",
-                            openJournalCount.toString(),
-                            Amber,
-                            Modifier.weight(1f)
-                        )
-
-                        JournalStat(
-                            "SELESAI",
-                            closedJournalCount.toString(),
-                            Color.White,
-                            Modifier.weight(1f)
-                        )
+                        JournalStat("TOTAL", totalJournalCount.toString(), Green, Modifier.weight(1f))
+                        JournalStat("OPEN", openJournalCount.toString(), Amber, Modifier.weight(1f))
+                        JournalStat("SELESAI", closedJournalCount.toString(), Color.White, Modifier.weight(1f))
                     }
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        JournalStat(
-                            "MENANG",
-                            winningCount.toString(),
-                            Green,
-                            Modifier.weight(1f)
-                        )
-
-                        JournalStat(
-                            "STOP LOSS",
-                            stopLossCount.toString(),
-                            Red,
-                            Modifier.weight(1f)
-                        )
-
-                        JournalStat(
-                            "WIN RATE",
-                            "%.1f%%".format(winRate),
-                            Amber,
-                            Modifier.weight(1f)
-                        )
+                        JournalStat("MENANG", winningCount.toString(), Green, Modifier.weight(1f))
+                        JournalStat("STOP LOSS", stopLossCount.toString(), Red, Modifier.weight(1f))
+                        JournalStat("WIN RATE", "%.1f%%".format(winRate), Amber, Modifier.weight(1f))
                     }
 
                     Text("Filter riwayat", color = Muted, fontSize = 12.sp)
 
                     Row(
-                        modifier = Modifier.horizontalScroll(
-                            rememberScrollState()
-                        ),
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(7.dp)
                     ) {
                         Chip("PAIR AKTIF", journalFilter == "PAIR AKTIF") {
                             journalFilter = "PAIR AKTIF"
                         }
-
                         Chip("SEMUA PAIR", journalFilter == "SEMUA PAIR") {
                             journalFilter = "SEMUA PAIR"
                         }
@@ -688,22 +646,16 @@ private fun LiveAnalyzerApp() {
                 Button(
                     onClick = { refreshKey++ },
                     modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF17382F)
-                    )
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF17382F))
                 ) {
                     Text("Reconnect / Refresh data", color = Green)
                 }
 
                 Button(
                     onClick = {
-                        if (
-                            Build.VERSION.SDK_INT >= 33 &&
-                            !hasNotificationPermission(context)
-                        ) {
-                            notificationPermissionLauncher.launch(
-                                Manifest.permission.POST_NOTIFICATIONS
-                            )
+                        if (Build.VERSION.SDK_INT >= 33 && !hasNotificationPermission(context)) {
+                            pendingBackgroundStart = true
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         } else {
                             val intent = android.content.Intent(
                                 context,
@@ -717,22 +669,15 @@ private fun LiveAnalyzerApp() {
                             )
 
                             if (backgroundEnabled) {
-                                intent.action =
-                                    BackgroundSignalService.ACTION_STOP
-
+                                intent.action = BackgroundSignalService.ACTION_STOP
                                 context.startService(intent)
                                 backgroundEnabled = false
                                 prefs.edit()
                                     .putBoolean("enabled", false)
                                     .apply()
                             } else {
-                                ContextCompat.startForegroundService(
-                                    context,
-                                    intent
-                                )
-
+                                ContextCompat.startForegroundService(context, intent)
                                 backgroundEnabled = true
-
                                 prefs.edit()
                                     .putBoolean("enabled", true)
                                     .putString(PREF_SYMBOL, symbol)
@@ -743,11 +688,7 @@ private fun LiveAnalyzerApp() {
                     },
                     modifier = Modifier.fillMaxWidth(),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (backgroundEnabled) {
-                            Color(0xFF4A2530)
-                        } else {
-                            Color(0xFF17382F)
-                        }
+                        containerColor = if (backgroundEnabled) Color(0xFF4A2530) else Color(0xFF17382F)
                     )
                 ) {
                     Text(
@@ -773,21 +714,15 @@ private fun LiveAnalyzerApp() {
 
                 Button(
                     onClick = {
-                        if (
-                            Build.VERSION.SDK_INT >= 33 &&
-                            !hasNotificationPermission(context)
-                        ) {
-                            notificationPermissionLauncher.launch(
-                                Manifest.permission.POST_NOTIFICATIONS
-                            )
+                        if (Build.VERSION.SDK_INT >= 33 && !hasNotificationPermission(context)) {
+                            pendingBackgroundStart = false
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         } else {
                             notificationsEnabled = hasNotificationPermission(context)
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF17382F)
-                    )
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF17382F))
                 ) {
                     Text(
                         if (notificationsEnabled) {
@@ -917,10 +852,7 @@ private fun JournalEntryCard(entry: TradingJournal) {
                 ) {
                     Text(
                         displayJournalStatus(entry),
-                        modifier = Modifier.padding(
-                            horizontal = 9.dp,
-                            vertical = 6.dp
-                        ),
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
                         color = statusColor,
                         fontSize = 10.sp,
                         fontWeight = FontWeight.ExtraBold
@@ -963,9 +895,7 @@ private fun JournalEntryCard(entry: TradingJournal) {
 
             LinearProgressIndicator(
                 progress = { closedPercent.toFloat() / 100f },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(6.dp),
+                modifier = Modifier.fillMaxWidth().height(6.dp),
                 color = Green,
                 trackColor = Color(0xFF283448)
             )
@@ -1000,9 +930,7 @@ private fun JournalEntryCard(entry: TradingJournal) {
 
             Text(
                 targets.joinToString("   "),
-                color = if (
-                    entry.tp1Hit || entry.tp2Hit || entry.tp3Hit
-                ) Green else Muted,
+                color = if (entry.tp1Hit || entry.tp2Hit || entry.tp3Hit) Green else Muted,
                 fontSize = 10.sp
             )
 
