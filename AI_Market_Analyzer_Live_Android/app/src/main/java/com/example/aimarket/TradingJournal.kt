@@ -19,44 +19,39 @@ data class TradingJournal(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0,
 
-    // Identitas sinyal
     val symbol: String,
     val timeframe: String,
     val direction: String,
     val signalTime: Long,
     val signalCandleTime: Long,
 
-    // Snapshot harga ketika sinyal dibuat
     val entryPrice: Double,
     val stopLoss: Double,
     val takeProfit1: Double,
     val takeProfit2: Double,
     val takeProfit3: Double?,
 
-    // Informasi analisis
     val score: Int,
 
-    // Status pemantauan hasil virtual
     val status: String = STATUS_OPEN,
     val tp1Hit: Boolean = false,
     val tp2Hit: Boolean = false,
     val tp3Hit: Boolean = false,
 
-    // Pembagian posisi untuk partial take profit
+    // Breakeven aktif setelah TP1 tercapai.
+    val breakevenActivated: Boolean = false,
+
     val tp1ClosedFraction: Double = DEFAULT_TP1_FRACTION,
     val tp2ClosedFraction: Double = DEFAULT_TP2_FRACTION,
     val tp3ClosedFraction: Double = DEFAULT_TP3_FRACTION,
 
-    // Akumulasi hasil dan sisa posisi
     val realizedR: Double = 0.0,
     val remainingFraction: Double = 1.0,
 
-    // Hasil akhir transaksi
     val exitPrice: Double? = null,
     val exitTime: Long? = null,
     val resultR: Double? = null,
 
-    // Audit dan pemulihan pemantauan
     val lastProcessedCandleTime: Long = signalCandleTime,
     val note: String? = null
 ) {
@@ -71,7 +66,6 @@ data class TradingJournal(
         const val DIRECTION_BUY = "BUY"
         const val DIRECTION_SELL = "SELL"
 
-        // Default pembagian posisi: total 100%
         const val DEFAULT_TP1_FRACTION = 0.50
         const val DEFAULT_TP2_FRACTION = 0.30
         const val DEFAULT_TP3_FRACTION = 0.20
