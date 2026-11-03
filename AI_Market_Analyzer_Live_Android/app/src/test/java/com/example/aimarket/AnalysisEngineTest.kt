@@ -5,12 +5,20 @@ import org.junit.Test
 
 class AnalysisEngineTest {
 
-    private fun candles(count: Int): List<Candle> =
+    private fun candles(
+        count: Int,
+        rising: Boolean = true
+    ): List<Candle> =
         (0 until count).map { i ->
-            val close = 100.0 + i * 0.5
+            val close = if (rising) {
+                100.0 + i * 0.5
+            } else {
+                150.0 - i * 0.5
+            }
+
             Candle(
                 time = (i + 1L) * 60_000L,
-                open = close - 0.2,
+                open = if (rising) close - 0.2 else close + 0.2,
                 high = close + 0.5,
                 low = close - 0.5,
                 close = close,
@@ -35,12 +43,14 @@ class AnalysisEngineTest {
             volume = 100.0,
             closed = false
         )
+
         assertNull(AnalysisEngine.analyze(input))
     }
 
     @Test
     fun enoughValidCandlesProduceValidResult() {
         val result = AnalysisEngine.analyze(candles(100))
+
         assertNotNull(result)
         assertTrue(result!!.lastPrice.isFinite())
         assertTrue(result.score in 0..100)
@@ -50,9 +60,96 @@ class AnalysisEngineTest {
     @Test
     fun sameInputProducesSameResult() {
         val input = candles(100)
+
         assertEquals(
             AnalysisEngine.analyze(input),
             AnalysisEngine.analyze(input)
+        )
+    }
+
+    @Test
+    fun bullishTrendProducesBuyWithValidTargets() {
+        val result = AnalysisEngine.analyze(
+            candles(100, rising = true)
+        )
+
+        assertNotNull(result)
+        val analysis = result!!
+
+        assertEquals("BUY", analysis.signal)
+        assertNotNull(analysis.entryPrice)
+        assertNotNull(analysis.stopLoss)
+        assertNotNull(analysis.takeProfit1)
+        assertNotNull(analysis.takeProfit2)
+
+        val entry = analysis.entryPrice!!
+        val sl = analysis.stopLoss!!
+        val tp1 = analysis.takeProfit1!!
+        val tp2 = analysis.takeProfit2!!
+
+        assertTrue(sl < entry)
+        assertTrue(tp1 > entry)
+        assertTrue(tp2 > tp1)
+
+        assertEquals(
+            1.15,
+            (entry - sl) / analysis.atr!!,
+            1e-6
+        )
+
+        assertEquals(
+            1.0,
+            (tp1 - entry) / (entry - sl),
+            1e-6
+        )
+
+        assertEquals(
+            2.0,
+            (tp2 - entry) / (entry - sl),
+            1e-6
+        )
+    }
+
+    @Test
+    fun bearishTrendProducesSellWithValidTargets() {
+        val result = AnalysisEngine.analyze(
+            candles(100, rising = false)
+        )
+
+        assertNotNull(result)
+        val analysis = result!!
+
+        assertEquals("SELL", analysis.signal)
+        assertNotNull(analysis.entryPrice)
+        assertNotNull(analysis.stopLoss)
+        assertNotNull(analysis.takeProfit1)
+        assertNotNull(analysis.takeProfit2)
+
+        val entry = analysis.entryPrice!!
+        val sl = analysis.stopLoss!!
+        val tp1 = analysis.takeProfit1!!
+        val tp2 = analysis.takeProfit2!!
+
+        assertTrue(sl > entry)
+        assertTrue(tp1 < entry)
+        assertTrue(tp2 < tp1)
+
+        assertEquals(
+            1.15,
+            (sl - entry) / analysis.atr!!,
+            1e-6
+        )
+
+        assertEquals(
+            1.0,
+            (entry - tp1) / (sl - entry),
+            1e-6
+        )
+
+        assertEquals(
+            2.0,
+            (entry - tp2) / (sl - entry),
+            1e-6
         )
     }
 }
