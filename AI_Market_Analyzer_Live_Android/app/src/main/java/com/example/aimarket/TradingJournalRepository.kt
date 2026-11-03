@@ -29,17 +29,27 @@ class TradingJournalRepository(context: Context) {
         dao.observeWinningCount()
 
     /**
-     * Memeriksa posisi OPEN untuk simbol dan timeframe tertentu.
+     * Memeriksa posisi OPEN dengan arah yang sama.
+     * BUY tidak menghalangi SELL, dan sebaliknya.
      */
     suspend fun hasOpenEntry(
         symbol: String,
-        timeframe: String
+        timeframe: String,
+        direction: String
     ): Boolean {
-        if (symbol.isBlank() || timeframe.isBlank()) return false
+        if (
+            symbol.isBlank() ||
+            timeframe.isBlank() ||
+            (
+                direction != TradingJournal.DIRECTION_BUY &&
+                direction != TradingJournal.DIRECTION_SELL
+            )
+        ) return false
 
         return dao.getOpenEntries().any {
             it.symbol.equals(symbol, ignoreCase = true) &&
-                it.timeframe.equals(timeframe, ignoreCase = true)
+                it.timeframe.equals(timeframe, ignoreCase = true) &&
+                it.direction.equals(direction, ignoreCase = true)
         }
     }
 
@@ -120,10 +130,11 @@ class TradingJournalRepository(context: Context) {
                 return@withTransaction -1L
             }
 
-            // Satu posisi OPEN per simbol dan timeframe.
+            // Hanya posisi dengan arah sama yang menghalangi sinyal baru.
             val alreadyOpen = dao.getOpenEntries().any {
                 it.symbol.equals(symbol, ignoreCase = true) &&
-                    it.timeframe.equals(timeframe, ignoreCase = true)
+                    it.timeframe.equals(timeframe, ignoreCase = true) &&
+                    it.direction.equals(direction, ignoreCase = true)
             }
 
             if (alreadyOpen) {
@@ -150,12 +161,6 @@ class TradingJournalRepository(context: Context) {
 
     /**
      * Memproses satu candle yang sudah tertutup.
-     *
-     * Candle sebelum atau sama dengan candle sinyal tidak boleh
-     * memengaruhi hasil posisi tersebut.
-     *
-     * Jika SL dan TP tersentuh dalam candle yang sama, SL
-     * diprioritaskan untuk sisa posisi sebagai kebijakan konservatif.
      */
     suspend fun processClosedCandle(
         symbol: String,
@@ -235,8 +240,7 @@ class TradingJournalRepository(context: Context) {
         var tp2Hit = entry.tp2Hit
         var tp3Hit = entry.tp3Hit
 
-        // SL menutup seluruh sisa posisi.
-        // TP baru pada candle yang sama tidak dihitung terlebih dahulu.
+        // SL diprioritaskan jika SL dan TP tersentuh bersamaan.
         if (stopHit) {
             val stopResult = realizedR - remaining
 
@@ -262,7 +266,7 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
-        // TP1 menutup 50% dari posisi awal.
+        // TP1 menutup 50% posisi awal.
         if (!tp1Hit && tp1HitNow) {
             val fraction = minOf(
                 entry.tp1ClosedFraction.coerceIn(0.0, 1.0),
@@ -276,7 +280,7 @@ class TradingJournalRepository(context: Context) {
             tp1Hit = true
         }
 
-        // TP2 menutup 30% dari posisi awal.
+        // TP2 menutup 30% posisi awal.
         if (!tp2Hit && tp2HitNow) {
             val fraction = minOf(
                 entry.tp2ClosedFraction.coerceIn(0.0, 1.0),
@@ -290,7 +294,7 @@ class TradingJournalRepository(context: Context) {
             tp2Hit = true
         }
 
-        // TP3 menutup semua sisa posisi.
+        // TP3 menutup seluruh sisa posisi.
         if (
             entry.takeProfit3 != null &&
             !tp3Hit &&
@@ -314,7 +318,7 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
-        // Jika tidak ada TP3, TP2 menutup seluruh sisa posisi.
+        // Jika TP3 tidak tersedia, TP2 menutup sisa posisi.
         if (entry.takeProfit3 == null && tp2Hit) {
             if (remaining > 0.0) {
                 realizedR += remaining *
@@ -334,7 +338,6 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
-        // Simpan checkpoint candle terakhir yang sudah diproses.
         return entry.copy(
             tp1Hit = tp1Hit,
             tp2Hit = tp2Hit,
