@@ -159,9 +159,6 @@ class BackgroundSignalService : Service() {
                         }
 
                         // Proses candle tertutup secara kronologis.
-                        // Repository jurnal juga memeriksa waktu sinyal
-                        // dan lastProcessedCandleTime sebagai perlindungan
-                        // tambahan terhadap pemrosesan berulang.
                         for (candle in closedCandles) {
                             if (!isCurrentFeed(
                                     myFeedGeneration,
@@ -184,8 +181,6 @@ class BackgroundSignalService : Service() {
                                 low = candle.low
                             )
 
-                            // Perbarui checkpoint setelah pemrosesan jurnal
-                            // berhasil diselesaikan.
                             lastClosedTime = candle.time
                         }
 
@@ -214,9 +209,18 @@ class BackgroundSignalService : Service() {
                             return@withLock
                         }
 
-                        // Jangan membuat posisi baru selama posisi lama
-                        // masih OPEN pada simbol dan timeframe ini.
-                        if (journal.hasOpenEntry(symbol, interval)) {
+                        // Posisi searah diperiksa di repository.
+                        // BUY dan SELL berlawanan boleh dicatat terpisah.
+                        if (
+                            journal.hasOpenEntry(
+                                symbol,
+                                interval,
+                                signal
+                            )
+                        ) {
+                            updateStatus(
+                                "Sinyal $signal dilewati: posisi searah masih OPEN"
+                            )
                             return@withLock
                         }
 
@@ -269,8 +273,7 @@ class BackgroundSignalService : Service() {
                             return@withLock
                         }
 
-                        // Hindari mencatat sinyal dari candle yang sudah
-                        // bukan candle terbaru pada feed aktif.
+                        // Jangan catat sinyal dari candle yang tidak valid.
                         if (newestClosed.time <= 0L) {
                             return@withLock
                         }
