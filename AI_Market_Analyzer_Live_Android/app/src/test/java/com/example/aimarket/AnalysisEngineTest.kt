@@ -2,16 +2,12 @@ package com.example.aimarket
 
 import org.junit.Assert.*
 import org.junit.Test
-import kotlin.math.sin
 
 class AnalysisEngineTest {
 
-    private fun candles(
-        count: Int,
-        rising: Boolean = true
-    ): List<Candle> =
+    private fun candles(count: Int): List<Candle> =
         (0 until count).map { i ->
-            val close = 100.0 + i * 0.5 * if (rising) 1.0 else -1.0
+            val close = 100.0 + i * 0.5
 
             Candle(
                 time = (i + 1L) * 60_000L,
@@ -24,22 +20,24 @@ class AnalysisEngineTest {
             )
         }
 
+    /**
+     * Membuat tren kuat dengan candle bullish/bearish
+     * yang valid dan ATR stabil.
+     */
     private fun trendingCandles(
+        count: Int,
         rising: Boolean
     ): List<Candle> =
-        (0 until 100).map { i ->
+        (0 until count).map { i ->
             val direction = if (rising) 1.0 else -1.0
-            val waveDirection = direction
-
-            val close = 100.0 +
-                direction * i * 0.08 +
-                waveDirection * sin(i * 0.65) * 1.5
+            val close = 100.0 + direction * i * 0.5
+            val open = close - direction * 1.0
 
             Candle(
                 time = (i + 1L) * 60_000L,
-                open = close - direction * 0.2,
-                high = close + 0.5,
-                low = close - 0.5,
+                open = open,
+                high = maxOf(open, close) + 0.2,
+                low = minOf(open, close) - 0.2,
                 close = close,
                 volume = 100.0,
                 closed = true
@@ -48,7 +46,9 @@ class AnalysisEngineTest {
 
     @Test
     fun insufficientCandlesReturnsNull() {
-        assertNull(AnalysisEngine.analyze(candles(51)))
+        assertNull(
+            AnalysisEngine.analyze(candles(51))
+        )
     }
 
     @Test
@@ -73,7 +73,9 @@ class AnalysisEngineTest {
         assertNotNull(result)
         assertTrue(result!!.lastPrice.isFinite())
         assertTrue(result.score in 0..100)
-        assertTrue(result.signal in setOf("BUY", "SELL", "WAIT"))
+        assertTrue(
+            result.signal in setOf("BUY", "SELL", "WAIT")
+        )
     }
 
     @Test
@@ -89,7 +91,7 @@ class AnalysisEngineTest {
     @Test
     fun bullishTrendProducesBuyWithValidTargets() {
         val result = AnalysisEngine.analyze(
-            trendingCandles(rising = true)
+            trendingCandles(100, rising = true)
         )
 
         assertNotNull(result)
@@ -113,6 +115,12 @@ class AnalysisEngineTest {
         assertTrue(tp2 > tp1)
 
         assertEquals(
+            1.15,
+            (entry - sl) / atr,
+            1e-6
+        )
+
+        assertEquals(
             1.0,
             (tp1 - entry) / (entry - sl),
             1e-6
@@ -123,14 +131,12 @@ class AnalysisEngineTest {
             (tp2 - entry) / (entry - sl),
             1e-6
         )
-
-        assertTrue((entry - sl) / atr <= 3.2)
     }
 
     @Test
     fun bearishTrendProducesSellWithValidTargets() {
         val result = AnalysisEngine.analyze(
-            trendingCandles(rising = false)
+            trendingCandles(100, rising = false)
         )
 
         assertNotNull(result)
@@ -154,6 +160,12 @@ class AnalysisEngineTest {
         assertTrue(tp2 < tp1)
 
         assertEquals(
+            1.15,
+            (sl - entry) / atr,
+            1e-6
+        )
+
+        assertEquals(
             1.0,
             (entry - tp1) / (sl - entry),
             1e-6
@@ -164,7 +176,5 @@ class AnalysisEngineTest {
             (entry - tp2) / (sl - entry),
             1e-6
         )
-
-        assertTrue((sl - entry) / atr <= 3.2)
     }
 }
