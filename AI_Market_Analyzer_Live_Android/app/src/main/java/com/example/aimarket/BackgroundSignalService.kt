@@ -193,14 +193,14 @@ class BackgroundSignalService : Service() {
                             lastClosedTime = candle.time
 
                             // Kirim notifikasi setiap event yang terdeteksi.
-                            journalEvents.forEach { event ->
+                            for (event in journalEvents) {
                                 if (!isCurrentFeed(
                                         myFeedGeneration,
                                         symbol,
                                         interval
                                     )
                                 ) {
-                                    return@withLock
+                                    break
                                 }
 
                                 sendJournalEventNotification(event)
