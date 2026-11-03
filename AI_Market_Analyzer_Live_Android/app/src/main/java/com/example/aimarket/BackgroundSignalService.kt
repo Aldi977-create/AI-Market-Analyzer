@@ -62,6 +62,7 @@ class BackgroundSignalService : Service() {
         flags: Int,
         startId: Int
     ): Int {
+
         if (intent?.action == ACTION_STOP) {
             stopMonitoring()
             return START_NOT_STICKY
@@ -96,7 +97,6 @@ class BackgroundSignalService : Service() {
             .putString("interval", interval)
             .apply()
 
-        // Invalidasi callback feed sebelumnya sebelum mengganti feed.
         val myFeedGeneration = synchronized(this) {
             feedGeneration += 1
             feedGeneration
@@ -110,8 +110,12 @@ class BackgroundSignalService : Service() {
 
         repository = LiveMarketRepository { candles, live, message ->
 
-            // Callback dari repository lama tidak boleh memproses data.
-            if (!isCurrentFeed(myFeedGeneration, symbol, interval)) {
+            if (!isCurrentFeed(
+                    myFeedGeneration,
+                    symbol,
+                    interval
+                )
+            ) {
                 return@LiveMarketRepository
             }
 
@@ -129,6 +133,7 @@ class BackgroundSignalService : Service() {
 
             serviceScope.launch {
                 processingMutex.withLock {
+
                     if (!isCurrentFeed(
                             myFeedGeneration,
                             symbol,
@@ -139,6 +144,7 @@ class BackgroundSignalService : Service() {
                     }
 
                     try {
+
                         val closedCandles = candles
                             .asSequence()
                             .filter { it.closed }
@@ -160,6 +166,7 @@ class BackgroundSignalService : Service() {
 
                         // Proses candle tertutup secara kronologis.
                         for (candle in closedCandles) {
+
                             if (!isCurrentFeed(
                                     myFeedGeneration,
                                     symbol,
@@ -173,15 +180,31 @@ class BackgroundSignalService : Service() {
                                 continue
                             }
 
-                            journal.processClosedCandle(
-                                symbol = symbol,
-                                timeframe = interval,
-                                candleTime = candle.time,
-                                high = candle.high,
-                                low = candle.low
-                            )
+                            // Proses jurnal dan ambil event yang baru terjadi.
+                            val journalEvents =
+                                journal.processClosedCandle(
+                                    symbol = symbol,
+                                    timeframe = interval,
+                                    candleTime = candle.time,
+                                    high = candle.high,
+                                    low = candle.low
+                                )
 
                             lastClosedTime = candle.time
+
+                            // Kirim notifikasi setiap event yang terdeteksi.
+                            journalEvents.forEach { event ->
+                                if (!isCurrentFeed(
+                                        myFeedGeneration,
+                                        symbol,
+                                        interval
+                                    )
+                                ) {
+                                    return@withLock
+                                }
+
+                                sendJournalEventNotification(event)
+                            }
                         }
 
                         if (!isCurrentFeed(
@@ -209,8 +232,6 @@ class BackgroundSignalService : Service() {
                             return@withLock
                         }
 
-                        // Posisi searah diperiksa di repository.
-                        // BUY dan SELL berlawanan boleh dicatat terpisah.
                         if (
                             journal.hasOpenEntry(
                                 symbol,
@@ -248,7 +269,6 @@ class BackgroundSignalService : Service() {
                             return@withLock
                         }
 
-                        // Pastikan level entry dan target sesuai arah.
                         val levelsValid =
                             if (signal == TradingJournal.DIRECTION_BUY) {
                                 sl < entry &&
@@ -273,7 +293,6 @@ class BackgroundSignalService : Service() {
                             return@withLock
                         }
 
-                        // Jangan catat sinyal dari candle yang tidak valid.
                         if (newestClosed.time <= 0L) {
                             return@withLock
                         }
@@ -293,6 +312,7 @@ class BackgroundSignalService : Service() {
                         )
 
                         if (insertedId > 0L) {
+
                             if (!isCurrentFeed(
                                     myFeedGeneration,
                                     symbol,
@@ -318,9 +338,11 @@ class BackgroundSignalService : Service() {
                                 score = analysis.score
                             )
                         }
+
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
+
                         Log.e(TAG, "Gagal memproses market", e)
 
                         if (isCurrentFeed(
@@ -358,6 +380,9 @@ class BackgroundSignalService : Service() {
     private fun notificationId(entryId: Long): Int =
         (entryId % Int.MAX_VALUE).toInt().coerceAtLeast(1)
 
+    /**
+     * Notifikasi sinyal entry baru.
+     */
     private fun sendSignalNotification(
         notificationId: Int,
         symbol: String,
@@ -369,6 +394,7 @@ class BackgroundSignalService : Service() {
         tp3: Double?,
         score: Int
     ) {
+
         val decimals = when {
             entry >= 1000.0 -> 2
             entry >= 1.0 -> 4
@@ -417,7 +443,131 @@ class BackgroundSignalService : Service() {
         }
     }
 
+    /**
+     * Notifikasi TP1, TP2, TP3, SL dan Breakeven.
+     */
+    private fun sendJournalEventNotification(
+        event: JournalEvent
+    ) {
+
+        if (!notificationsAllowed()) return
+
+        val decimals = when {
+            event.price >= 1000.0 -> 2
+            event.price >= 1.0 -> 4
+            else -> 6
+        }
+
+        fun price(value: Double): String =
+            String.format(
+                Locale.US,
+                "%.${decimals}f",
+                value
+            )
+
+        val resultText = event.resultR?.let {
+            String.format(Locale.US, "%.2fR", it)
+        } ?: "-"
+
+        val title: String
+        val message: String
+
+        when (event.type) {
+
+            "TP1" -> {
+                title = "TP1 tercapai • ${event.direction}"
+                message =
+                    "${event.symbol} ${event.timeframe}: " +
+                        "${price(event.price)} • " +
+                        "50% terealisasi • Breakeven aktif"
+            }
+
+            "TP2" -> {
+                title = "TP2 tercapai • ${event.direction}"
+                message =
+                    "${event.symbol} ${event.timeframe}: " +
+                        "${price(event.price)} • " +
+                        "Tambahan 30% terealisasi"
+            }
+
+            "TP3" -> {
+                title = "TP3 tercapai • ${event.direction}"
+                message =
+                    "${event.symbol} ${event.timeframe}: " +
+                        "${price(event.price)} • " +
+                        "Seluruh sisa posisi ditutup • " +
+                        "Hasil $resultText"
+            }
+
+            "TP2_FINAL" -> {
+                title = "Target akhir TP2 tercapai"
+                message =
+                    "${event.symbol} ${event.timeframe}: " +
+                        "${price(event.price)} • " +
+                        "Seluruh posisi selesai • Hasil $resultText"
+            }
+
+            "BREAKEVEN" -> {
+                title = "Breakeven tersentuh"
+                message =
+                    "${event.symbol} ${event.timeframe}: " +
+                        "Harga kembali ke Entry ${price(event.price)}"
+            }
+
+            "SL" -> {
+                title = "Stop Loss tersentuh"
+                message =
+                    "${event.symbol} ${event.timeframe}: " +
+                        "SL ${price(event.price)} • " +
+                        "Hasil $resultText"
+            }
+
+            else -> return
+        }
+
+        val notification =
+            NotificationCompat.Builder(this, SIGNAL_CHANNEL)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle(title)
+                .setContentText(message)
+                .setStyle(
+                    NotificationCompat.BigTextStyle()
+                        .bigText(message)
+                )
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .build()
+
+        try {
+
+            val eventCode = when (event.type) {
+                "TP1" -> 1
+                "TP2" -> 2
+                "TP3" -> 3
+                "SL" -> 4
+                "BREAKEVEN" -> 5
+                "TP2_FINAL" -> 6
+                else -> 9
+            }
+
+            val id = (
+                (event.entryId % 300_000_000L) * 10L +
+                    eventCode
+                ).toInt().coerceAtLeast(1)
+
+            NotificationManagerCompat
+                .from(this)
+                .notify(id, notification)
+
+        } catch (_: SecurityException) {
+            updateStatus(
+                "Izin notifikasi tidak tersedia"
+            )
+        }
+    }
+
     private fun notificationsAllowed(): Boolean {
+
         if (
             Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) !=
@@ -453,7 +603,9 @@ class BackgroundSignalService : Service() {
             .build()
 
     private fun createChannels() {
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+
             val manager =
                 getSystemService(NotificationManager::class.java)
 
@@ -468,7 +620,7 @@ class BackgroundSignalService : Service() {
             manager.createNotificationChannel(
                 NotificationChannel(
                     SIGNAL_CHANNEL,
-                    "Sinyal BUY/SELL",
+                    "Sinyal dan trading event",
                     NotificationManager.IMPORTANCE_HIGH
                 )
             )
@@ -476,6 +628,7 @@ class BackgroundSignalService : Service() {
     }
 
     private fun stopMonitoring() {
+
         synchronized(this) {
             feedGeneration += 1
         }
@@ -499,20 +652,25 @@ class BackgroundSignalService : Service() {
     }
 
     override fun onDestroy() {
+
         synchronized(this) {
             feedGeneration += 1
         }
 
         repository?.stop()
         repository = null
+
         serviceScope.cancel()
+
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
-        private const val TAG = "BackgroundSignalService"
+
+        private const val TAG =
+            "BackgroundSignalService"
 
         const val ACTION_STOP =
             "com.example.aimarket.STOP_MONITOR"
@@ -520,8 +678,11 @@ class BackgroundSignalService : Service() {
         const val EXTRA_SYMBOL = "symbol"
         const val EXTRA_INTERVAL = "interval"
 
-        const val STATUS_CHANNEL = "market_monitor_status"
-        const val SIGNAL_CHANNEL = "market_signal_alerts"
+        const val STATUS_CHANNEL =
+            "market_monitor_status"
+
+        const val SIGNAL_CHANNEL =
+            "market_signal_alerts"
 
         const val FOREGROUND_ID = 4101
     }
