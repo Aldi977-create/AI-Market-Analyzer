@@ -11,6 +11,7 @@ import androidx.room.RoomDatabase
 import androidx.room.Update
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.room.withTransaction
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -96,7 +97,7 @@ interface TradingJournalDao {
 
 @Database(
     entities = [TradingJournal::class],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class TradingJournalDatabase : RoomDatabase() {
@@ -108,6 +109,11 @@ abstract class TradingJournalDatabase : RoomDatabase() {
         @Volatile
         private var INSTANCE: TradingJournalDatabase? = null
 
+        /**
+         * Migrasi database versi 1 ke versi 2.
+         * Struktur ini dipertahankan agar pengguna lama
+         * tetap dapat memperbarui database.
+         */
         private val MIGRATION_1_2 = object : Migration(1, 2) {
             override fun migrate(db: SupportSQLiteDatabase) {
 
@@ -209,6 +215,7 @@ abstract class TradingJournalDatabase : RoomDatabase() {
                 )
 
                 db.execSQL("DROP TABLE trading_journal")
+
                 db.execSQL(
                     "ALTER TABLE trading_journal_new RENAME TO trading_journal"
                 )
@@ -241,6 +248,25 @@ abstract class TradingJournalDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Migrasi versi 2 ke versi 3.
+         * Menambahkan penyimpanan status breakeven.
+         *
+         * DEFAULT 0 berarti jurnal lama belum mengaktifkan
+         * breakeven. Data lama tidak dihapus.
+         */
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    ALTER TABLE trading_journal
+                    ADD COLUMN breakevenActivated
+                    INTEGER NOT NULL DEFAULT 0
+                    """.trimIndent()
+                )
+            }
+        }
+
         fun getInstance(context: Context): TradingJournalDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -248,7 +274,10 @@ abstract class TradingJournalDatabase : RoomDatabase() {
                     TradingJournalDatabase::class.java,
                     "trading_journal.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(
+                        MIGRATION_1_2,
+                        MIGRATION_2_3
+                    )
                     .build()
                     .also { INSTANCE = it }
             }
