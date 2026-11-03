@@ -6,6 +6,16 @@ import kotlinx.coroutines.flow.Flow
 import kotlin.math.abs
 import kotlin.math.max
 
+data class JournalEvent(
+    val entryId: Long,
+    val symbol: String,
+    val timeframe: String,
+    val direction: String,
+    val type: String,
+    val price: Double,
+    val resultR: Double? = null
+)
+
 class TradingJournalRepository(context: Context) {
 
     private val database =
@@ -28,10 +38,6 @@ class TradingJournalRepository(context: Context) {
     fun observeWinningCount(): Flow<Int> =
         dao.observeWinningCount()
 
-    /**
-     * BUY tidak menghalangi SELL dan sebaliknya.
-     * Posisi searah yang masih OPEN akan menghalangi sinyal baru.
-     */
     suspend fun hasOpenEntry(
         symbol: String,
         timeframe: String,
@@ -121,7 +127,6 @@ class TradingJournalRepository(context: Context) {
 
         return database.withTransaction {
 
-            // Anti-duplikat berdasarkan candle sinyal.
             if (
                 dao.findSignal(
                     symbol,
@@ -132,7 +137,6 @@ class TradingJournalRepository(context: Context) {
                 return@withTransaction -1L
             }
 
-            // Hanya posisi searah yang menghalangi sinyal baru.
             val alreadyOpen = dao.getOpenEntries().any {
                 it.symbol.equals(symbol, ignoreCase = true) &&
                     it.timeframe.equals(timeframe, ignoreCase = true) &&
@@ -162,7 +166,8 @@ class TradingJournalRepository(context: Context) {
     }
 
     /**
-     * Memproses candle yang sudah tertutup.
+     * Proses candle tertutup dan kembalikan event
+     * yang baru terjadi pada candle tersebut.
      */
     suspend fun processClosedCandle(
         symbol: String,
@@ -170,7 +175,8 @@ class TradingJournalRepository(context: Context) {
         candleTime: Long,
         high: Double,
         low: Double
-    ) {
+    ): List<JournalEvent> {
+
         if (
             symbol.isBlank() ||
             timeframe.isBlank() ||
@@ -180,9 +186,11 @@ class TradingJournalRepository(context: Context) {
             high <= 0.0 ||
             low <= 0.0 ||
             low > high
-        ) return
+        ) return emptyList()
 
-        database.withTransaction {
+        return database.withTransaction {
+
+            val events = mutableListOf<JournalEvent>()
 
             val entries = dao.getOpenEntries().filter { entry ->
                 entry.symbol.equals(symbol, ignoreCase = true) &&
@@ -201,7 +209,71 @@ class TradingJournalRepository(context: Context) {
                 )
 
                 dao.update(updated)
+
+                fun addEvent(
+                    type: String,
+                    price: Double,
+                    resultR: Double? = null
+                ) {
+                    events.add(
+                        JournalEvent(
+                            entryId = entry.id,
+                            symbol = entry.symbol,
+                            timeframe = entry.timeframe,
+                            direction = entry.direction,
+                            type = type,
+                            price = price,
+                            resultR = resultR
+                        )
+                    )
+                }
+
+                if (!entry.tp1Hit && updated.tp1Hit) {
+                    addEvent("TP1", entry.takeProfit1)
+                }
+
+                if (!entry.tp2Hit && updated.tp2Hit) {
+                    addEvent("TP2", entry.takeProfit2)
+                }
+
+                if (!entry.tp3Hit && updated.tp3Hit) {
+                    addEvent(
+                        "TP3",
+                        entry.takeProfit3
+                            ?: updated.exitPrice
+                            ?: entry.entryPrice,
+                        updated.resultR
+                    )
+                }
+
+                if (
+                    entry.status == TradingJournal.STATUS_OPEN &&
+                    updated.status == TradingJournal.STATUS_SL
+                ) {
+                    addEvent(
+                        if (entry.breakevenActivated) {
+                            "BREAKEVEN"
+                        } else {
+                            "SL"
+                        },
+                        updated.exitPrice ?: entry.stopLoss,
+                        updated.resultR
+                    )
+                }
+
+                if (
+                    entry.status == TradingJournal.STATUS_OPEN &&
+                    updated.status == TradingJournal.STATUS_TP2_FINAL
+                ) {
+                    addEvent(
+                        "TP2_FINAL",
+                        updated.exitPrice ?: entry.takeProfit2,
+                        updated.resultR
+                    )
+                }
             }
+
+            events
         }
     }
 
@@ -215,11 +287,8 @@ class TradingJournalRepository(context: Context) {
         val isBuy =
             entry.direction == TradingJournal.DIRECTION_BUY
 
-        /*
-         * Setelah TP1, gunakan Entry sebagai SL efektif.
-         * SL awal di database tidak diubah agar perhitungan
-         * risiko awal tetap akurat.
-         */
+        // SL efektif menjadi Entry setelah TP1.
+        // SL awal tetap disimpan untuk perhitungan R.
         val effectiveStopLoss =
             if (entry.breakevenActivated) {
                 entry.entryPrice
@@ -261,13 +330,7 @@ class TradingJournalRepository(context: Context) {
         var breakevenActivated =
             entry.breakevenActivated
 
-        /*
-         * SL diprioritaskan jika SL dan TP tersentuh
-         * pada candle yang sama.
-         *
-         * Jika breakeven sudah aktif, penutupan sisa posisi
-         * di Entry menghasilkan 0R untuk bagian tersebut.
-         */
+        // SL diprioritaskan pada candle yang sama.
         if (stopHit) {
 
             val remainingResult =
@@ -311,11 +374,7 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
-        /*
-         * TP1:
-         * Realisasi 50% posisi awal.
-         * Setelah TP1, aktifkan breakeven.
-         */
+        // TP1: tutup 50% dan aktifkan breakeven.
         if (!tp1Hit && tp1HitNow) {
 
             val fraction = minOf(
@@ -333,10 +392,7 @@ class TradingJournalRepository(context: Context) {
             breakevenActivated = true
         }
 
-        /*
-         * TP2:
-         * Realisasi 30% posisi awal.
-         */
+        // TP2: tutup 30% posisi awal.
         if (!tp2Hit && tp2HitNow) {
 
             val fraction = minOf(
@@ -353,10 +409,7 @@ class TradingJournalRepository(context: Context) {
             tp2Hit = true
         }
 
-        /*
-         * TP3:
-         * Tutup seluruh sisa posisi.
-         */
+        // TP3: tutup seluruh sisa posisi.
         if (
             entry.takeProfit3 != null &&
             !tp3Hit &&
@@ -383,10 +436,7 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
-        /*
-         * Jika TP3 tidak tersedia:
-         * TP2 menutup seluruh sisa posisi.
-         */
+        // Tanpa TP3, TP2 menutup seluruh sisa posisi.
         if (entry.takeProfit3 == null && tp2Hit) {
 
             if (remaining > 0.0) {
@@ -408,10 +458,6 @@ class TradingJournalRepository(context: Context) {
             )
         }
 
-        /*
-         * Simpan status TP dan breakeven.
-         * Status ini tersimpan melalui Room Database.
-         */
         return entry.copy(
             tp1Hit = tp1Hit,
             tp2Hit = tp2Hit,
@@ -424,9 +470,7 @@ class TradingJournalRepository(context: Context) {
     }
 
     /**
-     * Perhitungan R selalu menggunakan SL AWAL.
-     * Jangan gunakan effectiveStopLoss di fungsi ini,
-     * karena SL efektif bisa berubah menjadi harga Entry.
+     * Risiko selalu dihitung dari SL awal.
      */
     private fun calculateR(
         entry: TradingJournal,
