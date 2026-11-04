@@ -96,6 +96,18 @@ private fun LiveAnalyzerApp() {
     var status by remember { mutableStateOf("Menghubungkan…") }
     var refreshKey by remember { mutableIntStateOf(0) }
 
+    // Data dan status candle timeframe yang lebih tinggi.
+    var higherTimeframeCandles by remember {
+        mutableStateOf<List<Candle>>(emptyList())
+    }
+    var higherTimeframeName by remember {
+        mutableStateOf(HigherTimeframeFilter.higherTimeframeFor(interval).orEmpty())
+    }
+    var higherTimeframeReady by remember { mutableStateOf(false) }
+    var higherTimeframeStatus by remember {
+        mutableStateOf("Menunggu data timeframe tinggi…")
+    }
+
     var journalEntries by remember {
         mutableStateOf<List<TradingJournal>>(emptyList())
     }
@@ -195,12 +207,32 @@ private fun LiveAnalyzerApp() {
         }
     }
 
+    // Repository mengambil candle aktif dan candle timeframe tinggi
+    // dari sumber feed yang sama untuk pair yang sedang dipilih.
     DisposableEffect(symbol, interval, refreshKey) {
-        val repo = LiveMarketRepository { data, live, message ->
-            candles = data
-            connected = live
-            status = message
+        higherTimeframeCandles = emptyList()
+        higherTimeframeName =
+            HigherTimeframeFilter.higherTimeframeFor(interval).orEmpty()
+        higherTimeframeReady = false
+        higherTimeframeStatus = if (higherTimeframeName.isBlank()) {
+            "Timeframe tidak didukung"
+        } else {
+            "Menunggu data $higherTimeframeName…"
         }
+
+        val repo = LiveMarketRepository(
+            onHigherTimeframeUpdate = { data, timeframeName, ready, message ->
+                higherTimeframeCandles = data
+                higherTimeframeName = timeframeName
+                higherTimeframeReady = ready
+                higherTimeframeStatus = message
+            },
+            onUpdate = { data, live, message ->
+                candles = data
+                connected = live
+                status = message
+            }
+        )
 
         repo.start(symbol, interval)
 
@@ -209,8 +241,23 @@ private fun LiveAnalyzerApp() {
         }
     }
 
-    val result = remember(candles) {
-        AnalysisEngine.analyze(candles)
+    // Sinyal baru hanya boleh lolos jika filter HTF tersedia dan searah.
+    // Jika data HTF belum siap, AnalysisEngine harus menghasilkan WAIT.
+    val result = remember(
+        candles,
+        higherTimeframeCandles,
+        higherTimeframeReady,
+        interval
+    ) {
+        AnalysisEngine.analyze(
+            candles = candles,
+            higherTimeframeCandles = if (higherTimeframeReady) {
+                higherTimeframeCandles
+            } else {
+                null
+            },
+            timeframe = interval
+        )
     }
 
     val lastPrice = candles.lastOrNull()?.close
@@ -466,6 +513,15 @@ private fun LiveAnalyzerApp() {
                             "Tidak ada sinyal baru saat feed XAUUSD tidak tersedia.",
                             color = Muted,
                             fontSize = 12.sp
+                        )
+                    }
+
+                    if (activeJournal == null) {
+                        Text(
+                            "FILTER HTF ${higherTimeframeName.ifBlank { "—" }} • $higherTimeframeStatus",
+                            color = if (higherTimeframeReady) Green else Amber,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
                         )
                     }
 
