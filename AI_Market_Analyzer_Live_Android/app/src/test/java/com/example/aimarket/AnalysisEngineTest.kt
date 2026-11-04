@@ -20,10 +20,6 @@ class AnalysisEngineTest {
             )
         }
 
-    /**
-     * Membuat tren kuat dengan candle bullish/bearish
-     * yang valid dan ATR stabil.
-     */
     private fun trendingCandles(
         count: Int,
         rising: Boolean
@@ -43,6 +39,34 @@ class AnalysisEngineTest {
                 closed = true
             )
         }
+
+    /**
+     * Membuat candle HTF 15m yang memiliki tren kuat.
+     * Data berisi candle tertutup dan waktu penutupan valid.
+     */
+    private fun higherTimeframeCandles(
+        count: Int = 100,
+        bullish: Boolean
+    ): List<Candle> =
+        (0 until count).map { i ->
+            val direction = if (bullish) 1.0 else -1.0
+            val close = 100.0 + direction * i * 0.5
+            val open = close - direction * 1.0
+
+            Candle(
+                time = (i + 1L) * 900_000L,
+                open = open,
+                high = maxOf(open, close) + 0.2,
+                low = minOf(open, close) - 0.2,
+                close = close,
+                volume = 100.0,
+                closed = true
+            )
+        }
+
+    private fun analysisNow(htfCandles: List<Candle>): Long {
+        return htfCandles.last().time + 900_000L
+    }
 
     @Test
     fun insufficientCandlesReturnsNull() {
@@ -73,9 +97,7 @@ class AnalysisEngineTest {
         assertNotNull(result)
         assertTrue(result!!.lastPrice.isFinite())
         assertTrue(result.score in 0..100)
-        assertTrue(
-            result.signal in setOf("BUY", "SELL", "WAIT")
-        )
+        assertEquals("WAIT", result.signal)
     }
 
     @Test
@@ -89,9 +111,28 @@ class AnalysisEngineTest {
     }
 
     @Test
-    fun bullishTrendProducesBuyWithValidTargets() {
+    fun missingHigherTimeframeDataForcesWait() {
         val result = AnalysisEngine.analyze(
-            trendingCandles(100, rising = true)
+            candles = trendingCandles(100, rising = true)
+        )
+
+        assertNotNull(result)
+        assertEquals("WAIT", result!!.signal)
+        assertNull(result.entryPrice)
+        assertNull(result.stopLoss)
+        assertNull(result.takeProfit1)
+        assertNull(result.takeProfit2)
+    }
+
+    @Test
+    fun bullishTrendProducesBuyWithValidTargets() {
+        val htf = higherTimeframeCandles(bullish = true)
+
+        val result = AnalysisEngine.analyze(
+            candles = trendingCandles(100, rising = true),
+            higherTimeframeCandles = htf,
+            timeframe = "1m",
+            nowMillis = analysisNow(htf)
         )
 
         assertNotNull(result)
@@ -135,8 +176,13 @@ class AnalysisEngineTest {
 
     @Test
     fun bearishTrendProducesSellWithValidTargets() {
+        val htf = higherTimeframeCandles(bullish = false)
+
         val result = AnalysisEngine.analyze(
-            trendingCandles(100, rising = false)
+            candles = trendingCandles(100, rising = false),
+            higherTimeframeCandles = htf,
+            timeframe = "1m",
+            nowMillis = analysisNow(htf)
         )
 
         assertNotNull(result)
@@ -176,5 +222,39 @@ class AnalysisEngineTest {
             (entry - tp2) / (sl - entry),
             1e-6
         )
+    }
+
+    @Test
+    fun bullishSignalIsBlockedByBearishHigherTimeframe() {
+        val htf = higherTimeframeCandles(bullish = false)
+
+        val result = AnalysisEngine.analyze(
+            candles = trendingCandles(100, rising = true),
+            higherTimeframeCandles = htf,
+            timeframe = "1m",
+            nowMillis = analysisNow(htf)
+        )
+
+        assertNotNull(result)
+        assertEquals("WAIT", result!!.signal)
+        assertNull(result.entryPrice)
+        assertNull(result.stopLoss)
+    }
+
+    @Test
+    fun bearishSignalIsBlockedByBullishHigherTimeframe() {
+        val htf = higherTimeframeCandles(bullish = true)
+
+        val result = AnalysisEngine.analyze(
+            candles = trendingCandles(100, rising = false),
+            higherTimeframeCandles = htf,
+            timeframe = "1m",
+            nowMillis = analysisNow(htf)
+        )
+
+        assertNotNull(result)
+        assertEquals("WAIT", result!!.signal)
+        assertNull(result.entryPrice)
+        assertNull(result.stopLoss)
     }
 }
