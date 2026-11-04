@@ -45,6 +45,16 @@ class BackgroundSignalService : Service() {
     @Volatile
     private var feedGeneration = 0
 
+    // Data timeframe tinggi untuk filter sinyal background.
+    @Volatile
+    private var higherTimeframeCandles: List<Candle> = emptyList()
+
+    @Volatile
+    private var higherTimeframeName = ""
+
+    @Volatile
+    private var higherTimeframeReady = false
+
     override fun onCreate() {
         super.onCreate()
 
@@ -106,106 +116,75 @@ class BackgroundSignalService : Service() {
         repository = null
         lastClosedTime = 0L
 
-        updateStatus("Memulai pemantauan $symbol • $interval")
+        // Reset data HTF saat pair atau timeframe diganti.
+        higherTimeframeCandles = emptyList()
+        higherTimeframeName =
+            HigherTimeframeFilter.higherTimeframeFor(interval).orEmpty()
+        higherTimeframeReady = false
 
-        repository = LiveMarketRepository { candles, live, message ->
+        updateStatus(
+            "Memulai pemantauan $symbol • $interval • " +
+                "Menunggu HTF ${higherTimeframeName.ifBlank { "tidak didukung" }}"
+        )
 
-            if (!isCurrentFeed(
-                    myFeedGeneration,
-                    symbol,
-                    interval
-                )
-            ) {
-                return@LiveMarketRepository
-            }
+        repository = LiveMarketRepository(
+            onHigherTimeframeUpdate = {
+                    data,
+                    timeframeName,
+                    ready,
+                    message ->
 
-            updateStatus(
-                if (live) {
-                    "Memantau $symbol • $interval"
-                } else {
-                    message
+                if (!isCurrentFeed(
+                        myFeedGeneration,
+                        symbol,
+                        interval
+                    )
+                ) {
+                    return@LiveMarketRepository
                 }
-            )
 
-            if (candles.isEmpty()) {
-                return@LiveMarketRepository
-            }
+                higherTimeframeCandles = data
+                higherTimeframeName = timeframeName
+                higherTimeframeReady = ready
 
-            serviceScope.launch {
-                processingMutex.withLock {
-
-                    if (!isCurrentFeed(
-                            myFeedGeneration,
-                            symbol,
-                            interval
-                        )
-                    ) {
-                        return@withLock
+                updateStatus(
+                    if (ready) {
+                        "Memantau $symbol • $interval • HTF $timeframeName siap"
+                    } else {
+                        "Menunggu HTF $timeframeName • $message"
                     }
+                )
+            },
+            onUpdate = { candles, live, message ->
 
-                    try {
+                if (!isCurrentFeed(
+                        myFeedGeneration,
+                        symbol,
+                        interval
+                    )
+                ) {
+                    return@LiveMarketRepository
+                }
 
-                        val closedCandles = candles
-                            .asSequence()
-                            .filter { it.closed }
-                            .filter {
-                                it.time > 0L &&
-                                    it.high.isFinite() &&
-                                    it.low.isFinite() &&
-                                    it.high > 0.0 &&
-                                    it.low > 0.0 &&
-                                    it.high >= it.low
-                            }
-                            .distinctBy { it.time }
-                            .sortedBy { it.time }
-                            .toList()
+                if (!live) {
+                    updateStatus(message)
+                } else if (!higherTimeframeReady) {
+                    updateStatus(
+                        "Feed aktif • Menunggu konfirmasi HTF " +
+                            higherTimeframeName
+                    )
+                } else {
+                    updateStatus(
+                        "Memantau $symbol • $interval • HTF siap"
+                    )
+                }
 
-                        if (closedCandles.isEmpty()) {
-                            return@withLock
-                        }
+                if (candles.isEmpty()) {
+                    return@LiveMarketRepository
+                }
 
-                        // Proses candle tertutup secara kronologis.
-                        for (candle in closedCandles) {
-
-                            if (!isCurrentFeed(
-                                    myFeedGeneration,
-                                    symbol,
-                                    interval
-                                )
-                            ) {
-                                return@withLock
-                            }
-
-                            if (candle.time <= lastClosedTime) {
-                                continue
-                            }
-
-                            // Proses jurnal dan ambil event yang baru terjadi.
-                            val journalEvents =
-                                journal.processClosedCandle(
-                                    symbol = symbol,
-                                    timeframe = interval,
-                                    candleTime = candle.time,
-                                    high = candle.high,
-                                    low = candle.low
-                                )
-
-                            lastClosedTime = candle.time
-
-                            // Kirim notifikasi setiap event yang terdeteksi.
-                            for (event in journalEvents) {
-                                if (!isCurrentFeed(
-                                        myFeedGeneration,
-                                        symbol,
-                                        interval
-                                    )
-                                ) {
-                                    break
-                                }
-
-                                sendJournalEventNotification(event)
-                            }
-                        }
+                serviceScope.launch {
+                    processingMutex.withLock {
 
                         if (!isCurrentFeed(
                                 myFeedGeneration,
@@ -216,102 +195,71 @@ class BackgroundSignalService : Service() {
                             return@withLock
                         }
 
-                        val newestClosed = closedCandles.last()
+                        try {
 
-                        val analysis =
-                            AnalysisEngine.analyze(closedCandles)
-                                ?: return@withLock
+                            val closedCandles = candles
+                                .asSequence()
+                                .filter { it.closed }
+                                .filter {
+                                    it.time > 0L &&
+                                        it.high.isFinite() &&
+                                        it.low.isFinite() &&
+                                        it.high > 0.0 &&
+                                        it.low > 0.0 &&
+                                        it.high >= it.low
+                                }
+                                .distinctBy { it.time }
+                                .sortedBy { it.time }
+                                .toList()
 
-                        val signal =
-                            analysis.signal.uppercase(Locale.US)
-
-                        if (
-                            signal != TradingJournal.DIRECTION_BUY &&
-                            signal != TradingJournal.DIRECTION_SELL
-                        ) {
-                            return@withLock
-                        }
-
-                        if (
-                            journal.hasOpenEntry(
-                                symbol,
-                                interval,
-                                signal
-                            )
-                        ) {
-                            updateStatus(
-                                "Sinyal $signal dilewati: posisi searah masih OPEN"
-                            )
-                            return@withLock
-                        }
-
-                        val entry =
-                            analysis.entryPrice ?: analysis.lastPrice
-
-                        val sl = analysis.stopLoss
-                        val tp1 = analysis.takeProfit1
-                        val tp2 = analysis.takeProfit2
-                        val tp3 = analysis.takeProfit3
-
-                        if (
-                            !entry.isFinite() ||
-                            entry <= 0.0 ||
-                            sl == null ||
-                            !sl.isFinite() ||
-                            tp1 == null ||
-                            !tp1.isFinite() ||
-                            tp2 == null ||
-                            !tp2.isFinite()
-                        ) {
-                            updateStatus(
-                                "Level sinyal $signal tidak valid"
-                            )
-                            return@withLock
-                        }
-
-                        val levelsValid =
-                            if (signal == TradingJournal.DIRECTION_BUY) {
-                                sl < entry &&
-                                    tp1 > entry &&
-                                    tp2 > tp1 &&
-                                    (tp3 == null || (
-                                        tp3.isFinite() && tp3 > tp2
-                                    ))
-                            } else {
-                                sl > entry &&
-                                    tp1 < entry &&
-                                    tp2 < tp1 &&
-                                    (tp3 == null || (
-                                        tp3.isFinite() && tp3 < tp2
-                                    ))
+                            if (closedCandles.isEmpty()) {
+                                return@withLock
                             }
 
-                        if (!levelsValid) {
-                            updateStatus(
-                                "Level sinyal $signal tidak konsisten"
-                            )
-                            return@withLock
-                        }
+                            // Proses candle tertutup secara kronologis.
+                            // Pengelolaan posisi jurnal yang sudah OPEN
+                            // tetap berjalan meskipun HTF belum siap.
+                            for (candle in closedCandles) {
 
-                        if (newestClosed.time <= 0L) {
-                            return@withLock
-                        }
+                                if (!isCurrentFeed(
+                                        myFeedGeneration,
+                                        symbol,
+                                        interval
+                                    )
+                                ) {
+                                    return@withLock
+                                }
 
-                        val insertedId = journal.recordSignal(
-                            symbol = symbol,
-                            timeframe = interval,
-                            direction = signal,
-                            signalTime = System.currentTimeMillis(),
-                            signalCandleTime = newestClosed.time,
-                            entryPrice = entry,
-                            stopLoss = sl,
-                            takeProfit1 = tp1,
-                            takeProfit2 = tp2,
-                            takeProfit3 = tp3,
-                            score = analysis.score
-                        )
+                                if (candle.time <= lastClosedTime) {
+                                    continue
+                                }
 
-                        if (insertedId > 0L) {
+                                val journalEvents =
+                                    journal.processClosedCandle(
+                                        symbol = symbol,
+                                        timeframe = interval,
+                                        candleTime = candle.time,
+                                        high = candle.high,
+                                        low = candle.low
+                                    )
+
+                                lastClosedTime = candle.time
+
+                                // Notifikasi event posisi yang sudah tercatat.
+                                for (event in journalEvents) {
+
+                                    if (!isCurrentFeed(
+                                            myFeedGeneration,
+                                            symbol,
+                                            interval
+                                        )
+                                    ) {
+                                        break
+                                    }
+
+                                    sendJournalEventNotification(event)
+                                }
+                            }
 
                             if (!isCurrentFeed(
                                     myFeedGeneration,
@@ -322,43 +270,191 @@ class BackgroundSignalService : Service() {
                                 return@withLock
                             }
 
-                            updateStatus(
-                                "Jurnal mencatat $symbol $signal • $interval"
-                            )
+                            val newestClosed = closedCandles.last()
 
-                            sendSignalNotification(
-                                notificationId = notificationId(insertedId),
+                            // Jangan menghasilkan sinyal baru jika data HTF
+                            // belum tersedia atau belum siap.
+                            if (!higherTimeframeReady) {
+                                updateStatus(
+                                    "WAIT • Menunggu data HTF " +
+                                        higherTimeframeName
+                                )
+                                return@withLock
+                            }
+
+                            val htfSnapshot = higherTimeframeCandles
+                            val htfTimeframeSnapshot = higherTimeframeName
+
+                            if (htfSnapshot.isEmpty() ||
+                                htfTimeframeSnapshot.isBlank()
+                            ) {
+                                updateStatus(
+                                    "WAIT • Data timeframe tinggi tidak tersedia"
+                                )
+                                return@withLock
+                            }
+
+                            // Analisis wajib menggunakan candle HTF.
+                            // HigherTimeframeFilter akan memeriksa candle
+                            // tertutup, kecukupan data, dan kesegaran data.
+                            val analysis = AnalysisEngine.analyze(
+                                candles = closedCandles,
+                                higherTimeframeCandles = htfSnapshot,
+                                timeframe = interval
+                            ) ?: return@withLock
+
+                            val signal =
+                                analysis.signal.uppercase(Locale.US)
+
+                            if (
+                                signal != TradingJournal.DIRECTION_BUY &&
+                                signal != TradingJournal.DIRECTION_SELL
+                            ) {
+                                updateStatus(
+                                    "WAIT • Filter HTF $htfTimeframeSnapshot " +
+                                        "belum mengonfirmasi arah"
+                                )
+                                return@withLock
+                            }
+
+                            if (!isCurrentFeed(
+                                    myFeedGeneration,
+                                    symbol,
+                                    interval
+                                )
+                            ) {
+                                return@withLock
+                            }
+
+                            if (
+                                journal.hasOpenEntry(
+                                    symbol,
+                                    interval,
+                                    signal
+                                )
+                            ) {
+                                updateStatus(
+                                    "Sinyal $signal dilewati: posisi searah masih OPEN"
+                                )
+                                return@withLock
+                            }
+
+                            val entry =
+                                analysis.entryPrice ?: analysis.lastPrice
+
+                            val sl = analysis.stopLoss
+                            val tp1 = analysis.takeProfit1
+                            val tp2 = analysis.takeProfit2
+                            val tp3 = analysis.takeProfit3
+
+                            if (
+                                !entry.isFinite() ||
+                                entry <= 0.0 ||
+                                sl == null ||
+                                !sl.isFinite() ||
+                                tp1 == null ||
+                                !tp1.isFinite() ||
+                                tp2 == null ||
+                                !tp2.isFinite()
+                            ) {
+                                updateStatus(
+                                    "Level sinyal $signal tidak valid"
+                                )
+                                return@withLock
+                            }
+
+                            val levelsValid =
+                                if (signal == TradingJournal.DIRECTION_BUY) {
+                                    sl < entry &&
+                                        tp1 > entry &&
+                                        tp2 > tp1 &&
+                                        (tp3 == null || (
+                                            tp3.isFinite() && tp3 > tp2
+                                        ))
+                                } else {
+                                    sl > entry &&
+                                        tp1 < entry &&
+                                        tp2 < tp1 &&
+                                        (tp3 == null || (
+                                            tp3.isFinite() && tp3 < tp2
+                                        ))
+                                }
+
+                            if (!levelsValid) {
+                                updateStatus(
+                                    "Level sinyal $signal tidak konsisten"
+                                )
+                                return@withLock
+                            }
+
+                            if (newestClosed.time <= 0L) {
+                                return@withLock
+                            }
+
+                            val insertedId = journal.recordSignal(
                                 symbol = symbol,
-                                signal = signal,
-                                entry = entry,
-                                sl = sl,
-                                tp1 = tp1,
-                                tp2 = tp2,
-                                tp3 = tp3,
+                                timeframe = interval,
+                                direction = signal,
+                                signalTime = System.currentTimeMillis(),
+                                signalCandleTime = newestClosed.time,
+                                entryPrice = entry,
+                                stopLoss = sl,
+                                takeProfit1 = tp1,
+                                takeProfit2 = tp2,
+                                takeProfit3 = tp3,
                                 score = analysis.score
                             )
-                        }
 
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
+                            if (insertedId > 0L) {
 
-                        Log.e(TAG, "Gagal memproses market", e)
+                                if (!isCurrentFeed(
+                                        myFeedGeneration,
+                                        symbol,
+                                        interval
+                                    )
+                                ) {
+                                    return@withLock
+                                }
 
-                        if (isCurrentFeed(
-                                myFeedGeneration,
-                                symbol,
-                                interval
-                            )
-                        ) {
-                            updateStatus(
-                                "Terjadi kesalahan pemrosesan market"
-                            )
+                                updateStatus(
+                                    "Jurnal mencatat $symbol $signal • " +
+                                        "$interval • HTF $htfTimeframeSnapshot"
+                                )
+
+                                sendSignalNotification(
+                                    notificationId = notificationId(insertedId),
+                                    symbol = symbol,
+                                    signal = signal,
+                                    entry = entry,
+                                    sl = sl,
+                                    tp1 = tp1,
+                                    tp2 = tp2,
+                                    tp3 = tp3,
+                                    score = analysis.score
+                                )
+                            }
+
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+
+                            Log.e(TAG, "Gagal memproses market", e)
+
+                            if (isCurrentFeed(
+                                    myFeedGeneration,
+                                    symbol,
+                                    interval
+                                )
+                            ) {
+                                updateStatus(
+                                    "Terjadi kesalahan pemrosesan market"
+                                )
+                            }
                         }
                     }
                 }
             }
-        }
+        )
 
         repository?.start(symbol, interval)
 
@@ -636,6 +732,10 @@ class BackgroundSignalService : Service() {
         repository?.stop()
         repository = null
 
+        higherTimeframeCandles = emptyList()
+        higherTimeframeReady = false
+        higherTimeframeName = ""
+
         getSharedPreferences("market_monitor", MODE_PRIVATE)
             .edit()
             .putBoolean("enabled", false)
@@ -659,6 +759,9 @@ class BackgroundSignalService : Service() {
 
         repository?.stop()
         repository = null
+
+        higherTimeframeCandles = emptyList()
+        higherTimeframeReady = false
 
         serviceScope.cancel()
 
