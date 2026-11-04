@@ -11,6 +11,12 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class LiveMarketRepository(
+    private val onHigherTimeframeUpdate: (
+        List<Candle>,
+        String,
+        Boolean,
+        String
+    ) -> Unit = { _, _, _, _ -> },
     private val onUpdate: (List<Candle>, Boolean, String) -> Unit
 ) {
     private val client = OkHttpClient.Builder()
@@ -71,6 +77,9 @@ class LiveMarketRepository(
                 startBinanceFeed(myGeneration)
             }
         }
+
+        // Ambil candle timeframe tinggi secara terpisah dari chart aktif.
+        startHigherTimeframeFeed(myGeneration)
     }
 
     private fun startBinanceFeed(myGeneration: Int) {
@@ -642,6 +651,282 @@ class LiveMarketRepository(
     }
 
     /**
+     * Mengambil candle timeframe tinggi secara independen dari timeframe chart.
+     * Provider tetap sama sesuai pair aktif: Binance, Bitstamp, atau Biquote.
+     */
+    private fun startHigherTimeframeFeed(myGeneration: Int) {
+        val higherInterval =
+            HigherTimeframeFilter.higherTimeframeFor(currentInterval) ?: return
+
+        Thread {
+            while (isCurrent(myGeneration)) {
+                try {
+                    val now = System.currentTimeMillis()
+
+                    val parsed = when (currentSymbol) {
+                        "BTCUSD" -> loadBitstampHigherTimeframe(
+                            higherInterval,
+                            now
+                        )
+
+                        "XAUUSD" -> loadBiquoteHigherTimeframe(
+                            higherInterval,
+                            now
+                        )
+
+                        else -> loadBinanceHigherTimeframe(
+                            higherInterval,
+                            now
+                        )
+                    }
+
+                    val closed = parsed
+                        .filter { it.closed }
+                        .distinctBy { it.time }
+                        .sortedBy { it.time }
+                        .takeLast(300)
+
+                    val ready = closed.size >= 52
+
+                    val reason = if (ready) {
+                        "Data $higherInterval tersedia (${closed.size} candle tertutup)"
+                    } else {
+                        "Data $higherInterval belum cukup: ${closed.size}/52 candle tertutup"
+                    }
+
+                    publishHigherTimeframe(
+                        myGeneration,
+                        parsed,
+                        higherInterval,
+                        ready,
+                        reason
+                    )
+                } catch (e: Exception) {
+                    publishHigherTimeframe(
+                        myGeneration,
+                        emptyList(),
+                        higherInterval,
+                        false,
+                        "HTF $higherInterval tidak tersedia: " +
+                            (e.message ?: "kesalahan feed")
+                    )
+                }
+
+                try {
+                    Thread.sleep(60_000L)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+            }
+        }.start()
+    }
+
+    private fun loadBinanceHigherTimeframe(
+        interval: String,
+        now: Long
+    ): List<Candle> {
+        val url =
+            "https://api.binance.com/api/v3/klines" +
+                "?symbol=$currentSymbol&interval=$interval&limit=120"
+
+        val request = Request.Builder()
+            .url(url)
+            .get()
+            .build()
+
+        val parsed = mutableListOf<Candle>()
+
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("Binance HTTP ${response.code}")
+            }
+
+            val rows = JSONArray(response.body?.string() ?: "[]")
+
+            for (i in 0 until rows.length()) {
+                val row = rows.getJSONArray(i)
+                val time = row.getLong(0)
+                val closeTime = row.getLong(6)
+
+                val open = row.getString(1).toDouble()
+                val high = row.getString(2).toDouble()
+                val low = row.getString(3).toDouble()
+                val close = row.getString(4).toDouble()
+                val volume = row.getString(5).toDouble()
+
+                if (!validCandle(time, open, high, low, close)) continue
+
+                parsed.add(
+                    Candle(
+                        time = time,
+                        open = open,
+                        high = high,
+                        low = low,
+                        close = close,
+                        volume = volume,
+                        closed = closeTime < now
+                    )
+                )
+            }
+        }
+
+        return parsed.sortedBy { it.time }
+    }
+
+    private fun loadBitstampHigherTimeframe(
+        interval: String,
+        now: Long
+    ): List<Candle> {
+        val stepMs = intervalToSeconds(interval) * 1000L
+
+        val root = getJson(
+            "https://www.bitstamp.net/api/v2/ohlc/btcusd/" +
+                "?step=${stepMs / 1000L}&limit=120"
+        )
+
+        val bars = root.optJSONObject("data")?.optJSONArray("ohlc")
+            ?: throw IllegalStateException("Candle Bitstamp tidak tersedia")
+
+        val parsed = mutableListOf<Candle>()
+
+        for (i in 0 until bars.length()) {
+            val bar = bars.optJSONObject(i) ?: continue
+            val seconds = bar.optString("timestamp").toLongOrNull() ?: continue
+
+            if (seconds <= 0L || seconds > Long.MAX_VALUE / 1000L) continue
+
+            val time = seconds * 1000L
+            val open = bar.optString("open").toDoubleOrNull() ?: continue
+            val high = bar.optString("high").toDoubleOrNull() ?: continue
+            val low = bar.optString("low").toDoubleOrNull() ?: continue
+            val close = bar.optString("close").toDoubleOrNull() ?: continue
+            val volume = bar.optString("volume").toDoubleOrNull() ?: 0.0
+
+            if (!validCandle(time, open, high, low, close)) continue
+
+            parsed.add(
+                Candle(
+                    time = time,
+                    open = open,
+                    high = high,
+                    low = low,
+                    close = close,
+                    volume = volume,
+                    closed = time + stepMs <= now
+                )
+            )
+        }
+
+        return parsed.sortedBy { it.time }
+    }
+
+    private fun loadBiquoteHigherTimeframe(
+        interval: String,
+        now: Long
+    ): List<Candle> {
+        // Endpoint dan sumber data Biquote dipertahankan.
+        val quote = getJson(
+            "https://biquote.io/api/XAUUSD?allowStale=false"
+        )
+
+        val marketState =
+            quote.optString("marketState", "unknown").lowercase()
+        val stale = quote.optBoolean("stale", true)
+        val quoteAge = quote.optLong("quoteAgeSeconds", Long.MAX_VALUE)
+
+        if (marketState != "open" || stale || quoteAge > 300L) {
+            throw IllegalStateException(
+                "Quote Biquote tutup atau kedaluwarsa"
+            )
+        }
+
+        val root = getJson(
+            "https://biquote.io/api/XAUUSD/ohlc" +
+                "?interval=$interval&limit=120"
+        )
+
+        val bars = root.optJSONArray("bars")
+            ?: throw IllegalStateException("Respons bars Biquote tidak valid")
+
+        val duration = intervalToMillis(interval)
+            ?: throw IllegalStateException("Interval Biquote tidak valid")
+
+        val parsed = mutableListOf<Candle>()
+
+        for (i in 0 until bars.length()) {
+            val bar = bars.optJSONObject(i) ?: continue
+
+            val time = parseTimestampMillis(
+                bar.optString("openTime").trim()
+            ) ?: continue
+
+            if (time > now + 60_000L) continue
+
+            val open = bar.optDouble("open", Double.NaN)
+            val high = bar.optDouble("high", Double.NaN)
+            val low = bar.optDouble("low", Double.NaN)
+            val close = bar.optDouble("close", Double.NaN)
+
+            if (!validCandle(time, open, high, low, close)) continue
+
+            val explicitlyOpen = bar.optBoolean("isOpen", false)
+            val isClosed = !explicitlyOpen && time + duration <= now
+
+            parsed.add(
+                Candle(
+                    time = time,
+                    open = open,
+                    high = high,
+                    low = low,
+                    close = close,
+                    volume = bar.optDouble(
+                        "tickVolume",
+                        bar.optDouble("volume", 0.0)
+                    ),
+                    closed = isClosed
+                )
+            )
+        }
+
+        return parsed
+            .groupBy { it.time }
+            .map { (_, sameTime) -> sameTime.last() }
+            .sortedBy { it.time }
+    }
+
+    private fun intervalToMillis(interval: String): Long? {
+        return when (interval.lowercase()) {
+            "1m" -> 60_000L
+            "5m" -> 300_000L
+            "15m" -> 900_000L
+            "1h" -> 3_600_000L
+            "4h" -> 14_400_000L
+            else -> null
+        }
+    }
+
+    private fun publishHigherTimeframe(
+        myGeneration: Int,
+        data: List<Candle>,
+        timeframe: String,
+        ready: Boolean,
+        reason: String
+    ) {
+        val snapshot = data.toList()
+
+        main.post {
+            if (isCurrent(myGeneration)) {
+                onHigherTimeframeUpdate(
+                    snapshot,
+                    timeframe,
+                    ready,
+                    reason
+                )
+            }
+        }
+    }
+
+    /**
      * Biquote biasanya mengirim openTime sebagai ISO-8601 UTC.
      * Fallback numerik menerima timestamp dalam detik atau milidetik.
      */
@@ -694,11 +979,12 @@ class LiveMarketRepository(
     }
 
     private fun intervalToSeconds(interval: String): Int {
-        return when (interval) {
+        return when (interval.lowercase()) {
             "1m" -> 60
             "5m" -> 300
             "15m" -> 900
             "1h" -> 3600
+            "4h" -> 14_400
             else -> 60
         }
     }
