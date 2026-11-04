@@ -36,7 +36,19 @@ data class AnalysisResult(
 object AnalysisEngine {
     private data class Pivot(val index: Int, val price: Double)
 
-    fun analyze(candles: List<Candle>): AnalysisResult? {
+    /**
+     * Analisis hanya boleh menghasilkan BUY/SELL jika filter HTF
+     * memberikan konfirmasi arah yang sama.
+     *
+     * Pemanggilan lama analyze(candles) tetap bisa dikompilasi,
+     * tetapi akan menghasilkan WAIT karena data HTF tidak tersedia.
+     */
+    fun analyze(
+        candles: List<Candle>,
+        higherTimeframeCandles: List<Candle>? = null,
+        timeframe: String? = null,
+        nowMillis: Long = System.currentTimeMillis()
+    ): AnalysisResult? {
         val stable = candles
             .filter { it.closed && isValidCandle(it) }
             .distinctBy { it.time }
@@ -234,7 +246,7 @@ object AnalysisEngine {
 
         score = score.coerceIn(0, 100)
 
-        // Konfirmasi fleksibel: tidak semua indikator wajib searah.
+        // Sinyal awal berdasarkan analisis timeframe aktif.
         val bullishSetup = bullishTrend ||
             bullishMomentum ||
             (e9 > e21 && bullishBreakout)
@@ -243,10 +255,55 @@ object AnalysisEngine {
             bearishMomentum ||
             (e9 < e21 && bearishBreakout)
 
-        val signal = when {
+        val rawSignal = when {
             score >= 66 && bullishSetup && !bearishBreakout -> "BUY"
             score <= 34 && bearishSetup && !bullishBreakout -> "SELL"
             else -> "WAIT"
+        }
+
+        // Evaluasi timeframe tinggi. Tanpa data HTF, hasilnya UNAVAILABLE.
+        val higherTimeframeResult = if (
+            higherTimeframeCandles != null && !timeframe.isNullOrBlank()
+        ) {
+            HigherTimeframeFilter.evaluate(
+                candles = higherTimeframeCandles,
+                timeframe = timeframe,
+                nowMillis = nowMillis
+            )
+        } else {
+            null
+        }
+
+        val finalSignal = when {
+            higherTimeframeResult == null -> "WAIT"
+            !higherTimeframeResult.isReady -> "WAIT"
+            rawSignal == "BUY" && higherTimeframeResult.canBuy -> "BUY"
+            rawSignal == "SELL" && higherTimeframeResult.canSell -> "SELL"
+            else -> "WAIT"
+        }
+
+        when {
+            higherTimeframeResult == null -> {
+                reasons += "WAIT: data timeframe tinggi belum diberikan."
+            }
+            !higherTimeframeResult.isReady -> {
+                reasons += "WAIT: HTF ${higherTimeframeResult.timeframe} belum siap — ${higherTimeframeResult.reason}."
+            }
+            rawSignal == "BUY" && !higherTimeframeResult.canBuy -> {
+                reasons += "BUY diblokir: HTF ${higherTimeframeResult.timeframe} tidak bullish."
+            }
+            rawSignal == "SELL" && !higherTimeframeResult.canSell -> {
+                reasons += "SELL diblokir: HTF ${higherTimeframeResult.timeframe} tidak bearish."
+            }
+            finalSignal == "BUY" -> {
+                reasons += "Konfirmasi HTF ${higherTimeframeResult.timeframe} bullish."
+            }
+            finalSignal == "SELL" -> {
+                reasons += "Konfirmasi HTF ${higherTimeframeResult.timeframe} bearish."
+            }
+            else -> {
+                reasons += "WAIT: sinyal timeframe aktif belum searah dengan konfirmasi HTF."
+            }
         }
 
         var entry: Double? = null
@@ -255,8 +312,9 @@ object AnalysisEngine {
         var tp2: Double? = null
         var tp3: Double? = null
 
-        if ((signal == "BUY" || signal == "SELL") && atrValue != null) {
-            val isBuy = signal == "BUY"
+        // Level transaksi hanya dihitung jika sinyal akhir lolos filter HTF.
+        if ((finalSignal == "BUY" || finalSignal == "SELL") && atrValue != null) {
+            val isBuy = finalSignal == "BUY"
             val direction = if (isBuy) 1.0 else -1.0
             entry = last
 
@@ -313,8 +371,8 @@ object AnalysisEngine {
             }
         }
 
-        if (signal == "WAIT") {
-            reasons += "WAIT: skor atau konfirmasi arah belum cukup; tidak semua indikator wajib searah."
+        if (finalSignal == "WAIT") {
+            reasons += "WAIT: skor, konfirmasi arah, atau filter HTF belum memenuhi syarat."
         }
 
         reasons += "Skor adalah gabungan aturan teknikal, bukan probabilitas profit."
@@ -322,7 +380,7 @@ object AnalysisEngine {
 
         return AnalysisResult(
             lastPrice = last,
-            signal = signal,
+            signal = finalSignal,
             score = score,
             rsi = rsiValue,
             ema9 = e9,
